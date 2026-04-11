@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>Copilot Sessions</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <!-- Markdown rendering -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/DOMPurify/3.1.6/purify.min.js"></script>
+</head>
+<body>
+  <!-- Sidebar -->
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-header">
+      <h2>Sessions</h2>
+      <button id="new-session-btn" class="btn-icon" title="New session">＋</button>
+    </div>
+    <div id="session-list" class="session-list"></div>
+  </aside>
+
+  <!-- New Session Dialog -->
+  <div id="new-session-dialog" class="dialog-overlay" style="display:none">
+    <div class="dialog">
+      <h3>New Session</h3>
+      <div class="dialog-field">
+        <label for="new-cwd-input">Working Directory</label>
+        <input id="new-cwd-input" type="text" placeholder="e.g. C:\repos\my-project" />
+      </div>
+      <div class="dialog-field">
+        <label for="new-model-select">Model</label>
+        <select id="new-model-select">
+          <option value="">Loading models...</option>
+        </select>
+      </div>
+      <div class="dialog-actions">
+        <button id="new-session-cancel" class="dialog-btn dialog-btn-secondary">Cancel</button>
+        <button id="new-session-create" class="dialog-btn dialog-btn-primary">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sidebar overlay for mobile -->
+  <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+  <!-- Main chat area -->
+  <main class="chat-main">
+    <header class="chat-header">
+      <button id="menu-btn" class="btn-icon menu-btn" title="Sessions">☰</button>
+      <h1 id="chat-title">Copilot Sessions</h1>
+      <div class="header-meta">
+        <span id="header-cwd" class="header-cwd" title="Working directory"></span>
+        <select id="header-model-select" class="header-model-select" title="Change model" style="display:none">
+        </select>
+      </div>
+    </header>
+
+    <div id="messages" class="messages">
+      <div class="empty-state">
+        <div class="empty-icon">✦</div>
+        <p>Start a new session to begin</p>
+      </div>
+    </div>
+
+    <footer class="chat-input-bar">
+      <div class="input-wrapper">
+        <textarea
+          id="message-input"
+          placeholder="Send a message..."
+          rows="1"
+          autocomplete="off"
+        ></textarea>
+        <button id="send-btn" class="send-btn" disabled title="Send">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 2L11 13"></path>
+            <path d="M22 2L15 22L11 13L2 9L22 2Z"></path>
+          </svg>
+        </button>
+      </div>
+    </footer>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

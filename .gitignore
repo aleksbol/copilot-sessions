@@ -1,0 +1,4 @@
+node_modules/
+dist/
+.copilot-sessions/
+*.log
