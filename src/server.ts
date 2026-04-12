@@ -689,14 +689,30 @@ wss.on("connection", (ws: any) => {
           // Subscribe this client to the session's broadcasts
           subscribeToSession(ws, sessionId);
 
-          // Fetch and send history
-          try {
-            const events = await session.getMessages();
-            const history = eventsToHistory(events);
-            send(ws, { type: "session_history", sessionId, messages: history });
-          } catch (e: any) {
-            console.warn(`[session] could not get messages: ${e.message}`);
-            send(ws, { type: "session_history", sessionId, messages: [] });
+          // Fetch and send history (retry on transient "Session not found" errors)
+          {
+            const maxAttempts = 4;
+            const retryDelayMs = 800;
+            let historyFetched = false;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              try {
+                const events = await session.getMessages();
+                const history = eventsToHistory(events);
+                send(ws, { type: "session_history", sessionId, messages: history });
+                historyFetched = true;
+                break;
+              } catch (e: any) {
+                const isNotFound = e.message?.includes("Session not found") || e.message?.includes("session not found");
+                if (isNotFound && attempt < maxAttempts) {
+                  console.warn(`[session] getMessages attempt ${attempt} failed ("Session not found"), retrying in ${retryDelayMs}ms...`);
+                  await new Promise(res => setTimeout(res, retryDelayMs));
+                } else {
+                  console.warn(`[session] could not get messages after ${attempt} attempt(s): ${e.message}`);
+                  send(ws, { type: "session_history", sessionId, messages: [] });
+                  break;
+                }
+              }
+            }
           }
 
           const meta = sessionMeta.get(sessionId);
@@ -959,4 +975,15 @@ process.on("SIGINT", async () => {
   }
   try { await copilot.stop(); } catch {}
   process.exit(0);
+});
+
+// ── Crash protection ──
+// Prevent unhandled errors from killing the server process.
+
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] uncaught exception:", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] unhandled rejection:", reason);
 });
