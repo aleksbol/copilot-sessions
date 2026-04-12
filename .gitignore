@@ -2,3 +2,4 @@ node_modules/
 dist/
 .copilot-sessions/
 *.log
+session-meta.json
