@@ -15,6 +15,7 @@
   let currentSessionId = null;
   let sessions = [];
   let isStreaming = false;
+  const streamingSessionIds = new Set(); // track which sessions are actively streaming
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   const seenMessageIds = new Set();
@@ -343,11 +344,12 @@
             }
           }
           // If we were streaming, the content is already visible — just finalize
-          finishStreaming();
+          finishStreaming(msg.sessionId);
         }
         break;
 
       case "turn_start":
+        streamingSessionIds.add(msg.sessionId);
         if (msg.sessionId === currentSessionId) {
           isStreaming = true;
           reasoningBlocks.clear();
@@ -413,7 +415,7 @@
       case "done":
         if (msg.sessionId === currentSessionId) {
           hideThinkingIndicator();
-          finishStreaming();
+          finishStreaming(msg.sessionId);
         }
         break;
 
@@ -479,7 +481,7 @@
         console.error("[server]", msg.message);
         if (!msg.sessionId || msg.sessionId === currentSessionId) {
           appendErrorMessage(msg.message);
-          finishStreaming();
+          finishStreaming(msg.sessionId);
         }
         break;
 
@@ -505,7 +507,9 @@
 
   function updateHeaderMeta(cwd, model) {
     if (cwd != null) {
-      headerCwd.textContent = cwd;
+      // On mobile, show just the folder name; on desktop show full path
+      const displayCwd = window.innerWidth <= 768 ? cwd.split(/[/\\]/).filter(Boolean).pop() || cwd : cwd;
+      headerCwd.textContent = displayCwd;
       headerCwd.title = cwd;
     }
     if (model != null) {
@@ -578,6 +582,10 @@
 
   function resumeSession(sessionId) {
     currentSessionId = sessionId;
+    // Sync streaming state to the target session
+    isStreaming = streamingSessionIds.has(sessionId);
+    hideThinkingIndicator();
+    updateSendState();
     const session = sessions.find((s) => s.sessionId === sessionId);
     chatTitle.textContent = session?.title || "Session";
     updateHeaderMeta(session?.cwd || "", session?.model || "");
@@ -750,7 +758,8 @@
     scrollToBottom();
   }
 
-  function finishStreaming() {
+  function finishStreaming(sessionId) {
+    if (sessionId) streamingSessionIds.delete(sessionId);
     if (streamingBubble) {
       streamingBubble.classList.remove("streaming-cursor");
       streamingBubble.innerHTML = renderMarkdown(streamingBuffer);
@@ -1521,7 +1530,7 @@
 
     for (const file of files) {
       const section = document.createElement("div");
-      section.className = "diff-file expanded";
+      section.className = "diff-file";
 
       // Count additions/deletions
       let added = 0, removed = 0;
