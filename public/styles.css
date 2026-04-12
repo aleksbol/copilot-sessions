@@ -401,6 +401,19 @@ body {
 .message-user {
   display: flex;
   justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+
+.message-timestamp {
+  font-size: 10px;
+  color: var(--text-muted);
+  width: 100%;
+  padding: 0 2px;
+}
+
+.message-user .message-timestamp {
+  text-align: right;
 }
 
 .message-user .message-bubble {
@@ -1064,6 +1077,127 @@ body {
 
 .connection-dot.connected {
   background: var(--success);
+}
+
+/* ── Prompt cards (user input / elicitation) ── */
+
+.prompt-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin: 8px 0;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.prompt-card.prompt-answered {
+  border-color: var(--border);
+  opacity: 0.7;
+}
+
+.prompt-question {
+  font-size: 13.5px;
+  color: var(--text-primary);
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+
+.prompt-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.prompt-choice-btn {
+  padding: 6px 14px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.prompt-choice-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+}
+
+.prompt-choice-btn.selected {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.prompt-input-row {
+  display: flex;
+  gap: 6px;
+}
+
+.prompt-input {
+  flex: 1;
+  padding: 7px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+}
+
+.prompt-input:focus {
+  border-color: var(--accent);
+}
+
+.prompt-select {
+  width: 100%;
+  padding: 7px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.prompt-submit-btn {
+  padding: 7px 16px;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.prompt-submit-btn:hover {
+  background: var(--accent-hover);
+}
+
+.prompt-field {
+  margin-bottom: 10px;
+}
+
+.prompt-label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.prompt-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.prompt-answered-text {
+  font-size: 13px;
+  color: var(--text-muted);
+  font-style: italic;
 }
 
 /* ── Diff Panel ── */

@@ -363,6 +363,18 @@
       case "diff_result":
         renderDiffResult(msg);
         break;
+
+      case "user_input_request":
+        if (msg.sessionId === currentSessionId) {
+          renderUserInputRequest(msg);
+        }
+        break;
+
+      case "elicitation_request":
+        if (msg.sessionId === currentSessionId) {
+          renderElicitationRequest(msg);
+        }
+        break;
     }
   }
 
@@ -475,13 +487,17 @@
   function renderHistory(messages) {
     clearMessages();
 
+    let lastRole = null;
     for (const msg of messages) {
       switch (msg.role) {
         case "user":
-          appendUserMessage(msg.content);
+          appendUserMessage(msg.content, msg.timestamp);
           break;
         case "assistant":
-          if (msg.content) appendAssistantMessage(msg.content);
+          if (msg.content) {
+            const showTs = lastRole !== "assistant";
+            appendAssistantMessage(msg.content, showTs ? msg.timestamp : null);
+          }
           break;
         case "tool_call":
           appendToolStart(msg.name, msg.args, msg.callId, msg.intention);
@@ -490,22 +506,41 @@
           updateToolResult(msg.parentId || msg.callId, msg.result, msg.name);
           break;
       }
+      lastRole = msg.role;
     }
 
     scrollToBottom();
   }
 
-  function appendUserMessage(text) {
+  function formatTimestamp(ts) {
+    const d = ts ? new Date(ts) : new Date();
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function appendUserMessage(text, timestamp) {
     const div = document.createElement("div");
     div.className = "message message-user";
-    div.innerHTML = `<div class="message-bubble">${escapeHtml(text)}</div>`;
+    const bubble = document.createElement("div");
+    bubble.className = "message-bubble";
+    bubble.innerHTML = renderMarkdown(text);
+    div.appendChild(bubble);
+    const ts = document.createElement("span");
+    ts.className = "message-timestamp";
+    ts.textContent = formatTimestamp(timestamp);
+    div.appendChild(ts);
     messagesEl.appendChild(div);
     scrollToBottom();
   }
 
-  function appendAssistantMessage(markdown) {
+  function appendAssistantMessage(markdown, timestamp) {
     const div = document.createElement("div");
     div.className = "message message-assistant";
+    if (timestamp) {
+      const ts = document.createElement("span");
+      ts.className = "message-timestamp";
+      ts.textContent = formatTimestamp(timestamp);
+      div.appendChild(ts);
+    }
     const bubble = document.createElement("div");
     bubble.className = "message-bubble";
     bubble.innerHTML = renderMarkdown(markdown);
@@ -572,6 +607,10 @@
       isStreaming = true;
       const div = document.createElement("div");
       div.className = "message message-assistant";
+      const ts = document.createElement("span");
+      ts.className = "message-timestamp";
+      ts.textContent = formatTimestamp();
+      div.appendChild(ts);
       const bubble = document.createElement("div");
       bubble.className = "message-bubble streaming-cursor";
       div.appendChild(bubble);
@@ -1117,11 +1156,204 @@
   });
 
   messageInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    const isMobile = window.innerWidth <= 768;
+    if (e.key === "Enter" && !e.shiftKey && !isMobile) {
       e.preventDefault();
       handleSend();
     }
   });
+
+  // ── User input / Elicitation requests ──
+
+  function renderUserInputRequest(msg) {
+    flushStreamingBubble();
+
+    const card = document.createElement("div");
+    card.className = "prompt-card";
+    card.id = `prompt-${msg.requestId}`;
+
+    const question = document.createElement("div");
+    question.className = "prompt-question";
+    question.innerHTML = renderMarkdown(msg.question);
+    card.appendChild(question);
+
+    const choices = msg.choices || [];
+    if (choices.length > 0) {
+      const choicesDiv = document.createElement("div");
+      choicesDiv.className = "prompt-choices";
+      for (const choice of choices) {
+        const btn = document.createElement("button");
+        btn.className = "prompt-choice-btn";
+        btn.textContent = choice;
+        btn.onclick = () => {
+          wsSend({
+            type: "user_input_response",
+            requestId: msg.requestId,
+            answer: choice,
+            wasFreeform: false,
+          });
+          card.classList.add("prompt-answered");
+          card.innerHTML = `<div class="prompt-answered-text">✓ ${escapeHtml(choice)}</div>`;
+        };
+        choicesDiv.appendChild(btn);
+      }
+      card.appendChild(choicesDiv);
+    }
+
+    if (msg.allowFreeform !== false) {
+      const inputRow = document.createElement("div");
+      inputRow.className = "prompt-input-row";
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "prompt-input";
+      input.placeholder = "Type your answer...";
+      const submitBtn = document.createElement("button");
+      submitBtn.className = "prompt-submit-btn";
+      submitBtn.textContent = "Send";
+      const submit = () => {
+        const val = input.value.trim();
+        if (!val) return;
+        wsSend({
+          type: "user_input_response",
+          requestId: msg.requestId,
+          answer: val,
+          wasFreeform: true,
+        });
+        card.classList.add("prompt-answered");
+        card.innerHTML = `<div class="prompt-answered-text">✓ ${escapeHtml(val)}</div>`;
+      };
+      submitBtn.onclick = submit;
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") submit();
+      });
+      inputRow.appendChild(input);
+      inputRow.appendChild(submitBtn);
+      card.appendChild(inputRow);
+      setTimeout(() => input.focus(), 50);
+    }
+
+    messagesEl.appendChild(card);
+    scrollToBottom();
+  }
+
+  function renderElicitationRequest(msg) {
+    flushStreamingBubble();
+
+    const card = document.createElement("div");
+    card.className = "prompt-card";
+    card.id = `prompt-${msg.requestId}`;
+
+    if (msg.message) {
+      const question = document.createElement("div");
+      question.className = "prompt-question";
+      question.innerHTML = renderMarkdown(msg.message);
+      card.appendChild(question);
+    }
+
+    const schema = msg.schema;
+    const fields = schema?.properties || {};
+    const fieldEntries = Object.entries(fields);
+    const formValues = {};
+
+    for (const [key, field] of fieldEntries) {
+      const fieldDiv = document.createElement("div");
+      fieldDiv.className = "prompt-field";
+
+      if (field.title || field.description) {
+        const label = document.createElement("label");
+        label.className = "prompt-label";
+        label.textContent = field.title || field.description || key;
+        fieldDiv.appendChild(label);
+      }
+
+      // Enum or oneOf = dropdown/buttons
+      const options = field.enum || (field.oneOf || []).map(o => o.const);
+      const optionLabels = field.enumNames || (field.oneOf || []).map(o => o.title);
+
+      if (options && options.length > 0 && options.length <= 5) {
+        // Render as buttons for small choice sets
+        const choicesDiv = document.createElement("div");
+        choicesDiv.className = "prompt-choices";
+        for (let i = 0; i < options.length; i++) {
+          const btn = document.createElement("button");
+          btn.className = "prompt-choice-btn";
+          btn.textContent = optionLabels?.[i] || options[i];
+          btn.onclick = () => {
+            choicesDiv.querySelectorAll(".prompt-choice-btn").forEach(b => b.classList.remove("selected"));
+            btn.classList.add("selected");
+            formValues[key] = options[i];
+          };
+          if (field.default === options[i]) {
+            btn.classList.add("selected");
+            formValues[key] = options[i];
+          }
+          choicesDiv.appendChild(btn);
+        }
+        fieldDiv.appendChild(choicesDiv);
+      } else if (options && options.length > 5) {
+        // Render as select dropdown
+        const select = document.createElement("select");
+        select.className = "prompt-select";
+        for (let i = 0; i < options.length; i++) {
+          const opt = document.createElement("option");
+          opt.value = options[i];
+          opt.textContent = optionLabels?.[i] || options[i];
+          if (field.default === options[i]) opt.selected = true;
+          select.appendChild(opt);
+        }
+        formValues[key] = field.default || options[0];
+        select.onchange = () => { formValues[key] = select.value; };
+        fieldDiv.appendChild(select);
+      } else {
+        // Text input
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "prompt-input";
+        input.value = field.default || "";
+        formValues[key] = field.default || "";
+        input.oninput = () => { formValues[key] = input.value; };
+        fieldDiv.appendChild(input);
+      }
+
+      card.appendChild(fieldDiv);
+    }
+
+    // Action buttons
+    const actions = document.createElement("div");
+    actions.className = "prompt-actions";
+    const acceptBtn = document.createElement("button");
+    acceptBtn.className = "prompt-submit-btn";
+    acceptBtn.textContent = "Submit";
+    acceptBtn.onclick = () => {
+      wsSend({
+        type: "elicitation_response",
+        requestId: msg.requestId,
+        action: "accept",
+        content: formValues,
+      });
+      card.classList.add("prompt-answered");
+      card.innerHTML = `<div class="prompt-answered-text">✓ Submitted</div>`;
+    };
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "prompt-choice-btn";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.onclick = () => {
+      wsSend({
+        type: "elicitation_response",
+        requestId: msg.requestId,
+        action: "cancel",
+        content: {},
+      });
+      card.classList.add("prompt-answered");
+      card.innerHTML = `<div class="prompt-answered-text">✗ Cancelled</div>`;
+    };
+    actions.appendChild(cancelBtn);
+    actions.appendChild(acceptBtn);
+    card.appendChild(actions);
+
+    messagesEl.appendChild(card);
+    scrollToBottom();
+  }
 
   // ── Diff panel ──
 

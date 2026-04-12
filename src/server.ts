@@ -95,6 +95,11 @@ const clientSession = new Map<WebSocket, string>();
 // Track clientId → WebSocket to deduplicate connections from the same browser tab
 const clientConnections = new Map<string, WebSocket>();
 
+// Pending user input / elicitation requests waiting for UI response
+// requestId → { resolve }
+const pendingUserRequests = new Map<string, { resolve: (value: any) => void }>();
+let requestIdCounter = 0;
+
 // ── Express + HTTP server ──
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -175,6 +180,41 @@ function registerClient(ws: WebSocket, clientId: string) {
     try { existing.close(); } catch {}
   }
   clientConnections.set(clientId, ws);
+}
+
+function createUserInputHandler(sessionId: string) {
+  return (request: any, _invocation: any) => {
+    return new Promise<any>((resolve) => {
+      const reqId = `uir_${++requestIdCounter}`;
+      pendingUserRequests.set(reqId, { resolve });
+      broadcast(sessionId, {
+        type: "user_input_request",
+        sessionId,
+        requestId: reqId,
+        question: request.question ?? "",
+        choices: request.choices ?? [],
+        allowFreeform: request.allowFreeform ?? true,
+      });
+    });
+  };
+}
+
+function createElicitationHandler(sessionId: string) {
+  return (context: any) => {
+    return new Promise<any>((resolve) => {
+      const reqId = `elic_${++requestIdCounter}`;
+      pendingUserRequests.set(reqId, { resolve });
+      broadcast(sessionId, {
+        type: "elicitation_request",
+        sessionId,
+        requestId: reqId,
+        message: context.message ?? "",
+        schema: context.requestedSchema ?? null,
+        mode: context.mode ?? "form",
+        source: context.elicitationSource ?? "",
+      });
+    });
+  };
 }
 
 /**
@@ -432,9 +472,14 @@ wss.on("connection", (ws) => {
             streaming: true,
             workingDirectory: cwd,
             onPermissionRequest: approveAll,
+            onUserInputRequest: createUserInputHandler(msg.sessionId || "pending"),
+            onElicitationRequest: createElicitationHandler(msg.sessionId || "pending"),
           });
 
           const sessionId = session.sessionId;
+          // Re-wire handlers with the real sessionId
+          session.registerUserInputHandler(createUserInputHandler(sessionId));
+          session.registerElicitationHandler(createElicitationHandler(sessionId));
           activeSessions.set(sessionId, session);
           sessionMeta.set(sessionId, { cwd, model });
           saveSessionMeta();
@@ -516,6 +561,8 @@ wss.on("connection", (ws) => {
                 const reSession = await copilot.resumeSession(msg.sessionId, {
                   streaming: true,
                   onPermissionRequest: approveAll,
+                  onUserInputRequest: createUserInputHandler(msg.sessionId),
+                  onElicitationRequest: createElicitationHandler(msg.sessionId),
                 });
                 activeSessions.set(msg.sessionId, reSession);
                 bindSessionEvents(reSession, msg.sessionId);
@@ -587,6 +634,8 @@ wss.on("connection", (ws) => {
               session = await copilot.resumeSession(sessionId, {
                 streaming: true,
                 onPermissionRequest: approveAll,
+                onUserInputRequest: createUserInputHandler(sessionId),
+                onElicitationRequest: createElicitationHandler(sessionId),
               });
             } catch (resumeErr: any) {
               console.error(`[session] resume failed:`, resumeErr);
@@ -730,6 +779,32 @@ wss.on("connection", (ws) => {
               stat: "",
               error: e?.message ?? "Failed to get diff",
               cwd,
+            });
+          }
+          break;
+        }
+
+        // ── User input response (from UI) ──
+        case "user_input_response": {
+          const pending = pendingUserRequests.get(msg.requestId);
+          if (pending) {
+            pendingUserRequests.delete(msg.requestId);
+            pending.resolve({
+              answer: msg.answer ?? "",
+              wasFreeform: msg.wasFreeform ?? true,
+            });
+          }
+          break;
+        }
+
+        // ── Elicitation response (from UI) ──
+        case "elicitation_response": {
+          const pending = pendingUserRequests.get(msg.requestId);
+          if (pending) {
+            pendingUserRequests.delete(msg.requestId);
+            pending.resolve({
+              action: msg.action ?? "cancel",
+              content: msg.content ?? {},
             });
           }
           break;
