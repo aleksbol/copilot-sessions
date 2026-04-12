@@ -4,7 +4,7 @@
   "description": "Access GitHub Copilot CLI sessions from any device via a web interface",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "tsx src/server.ts",
     "start": "tsx src/server.ts",
     "tunnel": "devtunnel host"
   },

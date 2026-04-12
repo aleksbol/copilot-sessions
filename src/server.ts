@@ -4,6 +4,8 @@ import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "node:http";
 import path from "node:path";
+import fs from "node:fs";
+import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // ── Config ──
@@ -48,8 +50,35 @@ async function ensureClient() {
 // Track active SDK sessions: sessionId → CopilotSession
 const activeSessions = new Map<string, CopilotSession>();
 
-// Per-session metadata (cwd, model) — persists for the lifetime of the server
+// Per-session metadata (cwd, model) — persisted to disk so it survives restarts
+const SESSION_META_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "session-meta.json");
 const sessionMeta = new Map<string, { cwd: string; model: string }>();
+
+function loadSessionMeta() {
+  try {
+    if (fs.existsSync(SESSION_META_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SESSION_META_FILE, "utf-8"));
+      for (const [k, v] of Object.entries(data)) {
+        sessionMeta.set(k, v as { cwd: string; model: string });
+      }
+      console.log(`[meta] loaded ${sessionMeta.size} session(s) from disk`);
+    }
+  } catch (e: any) {
+    console.warn(`[meta] failed to load: ${e.message}`);
+  }
+}
+
+function saveSessionMeta() {
+  try {
+    const obj: Record<string, { cwd: string; model: string }> = {};
+    for (const [k, v] of sessionMeta) obj[k] = v;
+    fs.writeFileSync(SESSION_META_FILE, JSON.stringify(obj, null, 2));
+  } catch (e: any) {
+    console.warn(`[meta] failed to save: ${e.message}`);
+  }
+}
+
+loadSessionMeta();
 
 // Track whether the event listener already delivered content for the current turn
 // sessionId → boolean
@@ -157,6 +186,36 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
     const data = event.data as any;
 
     switch (event.type) {
+      // ── Streaming reasoning deltas ──
+      case "assistant.reasoning_delta":
+        broadcast(sessionId, {
+          type: "reasoning_delta",
+          sessionId,
+          reasoningId: data.reasoningId,
+          delta: data.deltaContent ?? "",
+        });
+        break;
+
+      // ── Complete reasoning block ──
+      case "assistant.reasoning":
+        broadcast(sessionId, {
+          type: "reasoning",
+          sessionId,
+          reasoningId: data.reasoningId,
+          content: data.content ?? "",
+        });
+        break;
+
+      // ── Context window usage ──
+      case "session.usage_info":
+        broadcast(sessionId, {
+          type: "usage_info",
+          sessionId,
+          currentTokens: data.currentTokens,
+          tokenLimit: data.tokenLimit,
+        });
+        break;
+
       // ── Streaming text tokens ──
       case "assistant.message_delta":
         turnDeliveredByEvents.set(sessionId, true);
@@ -199,8 +258,8 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
         broadcast(sessionId, {
           type: "tool_start",
           sessionId,
-          name: data.name ?? data.toolName ?? "unknown",
-          args: data.args ?? data.input ?? data,
+          name: data.toolName ?? data.name ?? "unknown",
+          args: data.arguments ?? data.args ?? data.input ?? {},
           callId: event.id,
           intention: data.intention ?? "",
         });
@@ -212,7 +271,7 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
         broadcast(sessionId, {
           type: "tool_result",
           sessionId,
-          name: data.name ?? data.toolName ?? "unknown",
+          name: data.toolName ?? data.name ?? "unknown",
           result: typeof result === "string" ? result : JSON.stringify(result),
           callId: event.id,
           parentId: event.parentId ?? undefined,
@@ -225,7 +284,7 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
         broadcast(sessionId, {
           type: "tool_progress",
           sessionId,
-          name: data.name ?? "unknown",
+          name: data.toolName ?? data.name ?? "unknown",
           progress: data.progress ?? "",
           callId: event.id,
         });
@@ -378,6 +437,7 @@ wss.on("connection", (ws) => {
           const sessionId = session.sessionId;
           activeSessions.set(sessionId, session);
           sessionMeta.set(sessionId, { cwd, model });
+          saveSessionMeta();
           bindSessionEvents(session, sessionId);
           subscribeToSession(ws, sessionId);
 
@@ -446,10 +506,49 @@ wss.on("connection", (ws) => {
             }
           } catch (sendErr: any) {
             console.error(`[message] sendAndWait error:`, sendErr);
+            const errMsg = sendErr?.message ?? String(sendErr);
+
+            // If CLI lost the session, clear stale state and auto-retry resume + send
+            if (errMsg.includes("Session not found") || errMsg.includes("session not found")) {
+              console.log(`[message] session lost in CLI — attempting re-resume...`);
+              activeSessions.delete(msg.sessionId);
+              try {
+                const reSession = await copilot.resumeSession(msg.sessionId, {
+                  streaming: true,
+                  onPermissionRequest: approveAll,
+                });
+                activeSessions.set(msg.sessionId, reSession);
+                bindSessionEvents(reSession, msg.sessionId);
+                console.log(`[message] re-resumed, retrying send...`);
+
+                const retryResult = await reSession.sendAndWait(
+                  { prompt: msg.content },
+                  600_000,
+                );
+                const retryData = retryResult?.data as any;
+                const retryContent = retryData?.content ?? "";
+                const evH = turnDeliveredByEvents.get(msg.sessionId) ?? false;
+                turnDeliveredByEvents.set(msg.sessionId, false);
+                if (!evH && retryContent) {
+                  broadcast(msg.sessionId, { type: "assistant_message", sessionId: msg.sessionId, content: retryContent });
+                  broadcast(msg.sessionId, { type: "done", sessionId: msg.sessionId });
+                }
+                break;
+              } catch (retryErr: any) {
+                console.error(`[message] re-resume failed:`, retryErr);
+                send(ws, {
+                  type: "error",
+                  sessionId: msg.sessionId,
+                  message: `Session lost and could not recover: ${retryErr?.message ?? retryErr}`,
+                });
+                break;
+              }
+            }
+
             send(ws, {
               type: "error",
               sessionId: msg.sessionId,
-              message: `Send error: ${sendErr?.message ?? sendErr}`,
+              message: `Send error: ${errMsg}`,
             });
           }
           break;
@@ -484,16 +583,28 @@ wss.on("connection", (ws) => {
 
           if (!session) {
             // Resume via SDK — this reconnects to the CLI's persisted session
-            session = await copilot.resumeSession(sessionId, {
-              streaming: true,
-              onPermissionRequest: approveAll,
-            });
+            try {
+              session = await copilot.resumeSession(sessionId, {
+                streaming: true,
+                onPermissionRequest: approveAll,
+              });
+            } catch (resumeErr: any) {
+              console.error(`[session] resume failed:`, resumeErr);
+              send(ws, {
+                type: "error",
+                sessionId,
+                message: `Could not resume session: ${resumeErr?.message ?? resumeErr}`,
+              });
+              break;
+            }
             activeSessions.set(sessionId, session);
             bindSessionEvents(session, sessionId);
           }
 
           // Subscribe this client to the session's broadcasts
           subscribeToSession(ws, sessionId);
+
+          // Meta is loaded from disk; no-op if already known
 
           // Fetch and send history
           try {
@@ -512,7 +623,7 @@ wss.on("connection", (ws) => {
             cwd: meta?.cwd ?? "",
             model: meta?.model ?? "",
           });
-          console.log(`[session] resumed: ${sessionId}`);
+          console.log(`[session] resumed: ${sessionId}, cwd=${meta?.cwd}, model=${meta?.model}`);
           break;
         }
 
@@ -558,7 +669,7 @@ wss.on("connection", (ws) => {
           try {
             await session.setModel(newModel);
             const meta = sessionMeta.get(msg.sessionId);
-            if (meta) meta.model = newModel;
+            if (meta) { meta.model = newModel; saveSessionMeta(); }
             // Notify all subscribers
             broadcast(msg.sessionId, {
               type: "model_changed",
@@ -567,6 +678,59 @@ wss.on("connection", (ws) => {
             });
           } catch (e: any) {
             send(ws, { type: "error", sessionId: msg.sessionId, message: `Model change failed: ${e.message}` });
+          }
+          break;
+        }
+
+        // -- Abort current turn --
+        case "abort": {
+          const session = activeSessions.get(msg.sessionId);
+          if (session) {
+            try {
+              await session.abort();
+              broadcast(msg.sessionId, { type: "done", sessionId: msg.sessionId });
+            } catch (e: any) {
+              console.warn("[abort] error:", e.message);
+            }
+          }
+          break;
+        }
+
+        // ── Git diff for workspace ──
+        case "get_diff": {
+          const meta = sessionMeta.get(msg.sessionId);
+          const cwd = meta?.cwd || DEFAULT_CWD;
+          try {
+            // git diff HEAD shows both staged and unstaged vs last commit
+            const diff = execSync("git diff HEAD", {
+              cwd,
+              encoding: "utf-8",
+              maxBuffer: 10 * 1024 * 1024,
+              timeout: 15000,
+            });
+            // Also get a summary of changed files
+            const stat = execSync("git diff HEAD --stat", {
+              cwd,
+              encoding: "utf-8",
+              maxBuffer: 1024 * 1024,
+              timeout: 5000,
+            });
+            send(ws, {
+              type: "diff_result",
+              sessionId: msg.sessionId,
+              diff,
+              stat,
+              cwd,
+            });
+          } catch (e: any) {
+            send(ws, {
+              type: "diff_result",
+              sessionId: msg.sessionId,
+              diff: "",
+              stat: "",
+              error: e?.message ?? "Failed to get diff",
+              cwd,
+            });
           }
           break;
         }

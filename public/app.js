@@ -17,7 +17,8 @@
   let isStreaming = false;
   let reconnectTimer = null;
   let reconnectAttempts = 0;
-  const seenMessageIds = new Set(); // dedup broadcasts by server-assigned _mid
+  const seenMessageIds = new Set();
+  const reasoningBlocks = new Map(); // reasoningId → { block, contentEl, streaming }
 
   // ── DOM refs ──
 
@@ -30,6 +31,7 @@
   const messagesEl = document.getElementById("messages");
   const messageInput = document.getElementById("message-input");
   const sendBtn = document.getElementById("send-btn");
+  const stopBtn = document.getElementById("stop-btn");
   const headerCwd = document.getElementById("header-cwd");
   const headerModelSelect = document.getElementById("header-model-select");
   const newSessionDialog = document.getElementById("new-session-dialog");
@@ -37,19 +39,27 @@
   const newModelSelect = document.getElementById("new-model-select");
   const newSessionCancel = document.getElementById("new-session-cancel");
   const newSessionCreate = document.getElementById("new-session-create");
+  const contextBar = document.getElementById("context-bar");
+  const contextBarFill = document.getElementById("context-bar-fill");
+  const contextBarLabel = document.getElementById("context-bar-label");
+  const diffBtn = document.getElementById("diff-btn");
+  const diffPanel = document.getElementById("diff-panel");
+  const diffOverlay = document.getElementById("diff-overlay");
+  const diffCloseBtn = document.getElementById("diff-close-btn");
+  const diffRefreshBtn = document.getElementById("diff-refresh-btn");
+  const diffStatEl = document.getElementById("diff-stat");
+  const diffContentEl = document.getElementById("diff-content");
 
   // ── Markdown setup ──
 
-  marked.setOptions({
-    highlight: function (code, lang) {
-      if (lang && hljs.getLanguage(lang)) {
-        return hljs.highlight(code, { language: lang }).value;
-      }
-      return hljs.highlightAuto(code).value;
-    },
-    breaks: true,
-    gfm: true,
-  });
+  marked.use({ breaks: true, gfm: true });
+
+  // Syntax highlight after rendering
+  function highlightRenderedCode(el) {
+    el.querySelectorAll("pre code").forEach((block) => {
+      if (!block.dataset.highlighted) hljs.highlightElement(block);
+    });
+  }
 
   // ── WebSocket ──
 
@@ -217,8 +227,28 @@
       case "turn_start":
         if (msg.sessionId === currentSessionId) {
           isStreaming = true;
+          reasoningBlocks.clear();
           showThinkingIndicator();
           updateSendState();
+        }
+        break;
+
+      case "reasoning_delta":
+        if (msg.sessionId === currentSessionId) {
+          hideThinkingIndicator();
+          appendReasoningDelta(msg.reasoningId, msg.delta);
+        }
+        break;
+
+      case "reasoning":
+        if (msg.sessionId === currentSessionId) {
+          finalizeReasoning(msg.reasoningId, msg.content);
+        }
+        break;
+
+      case "usage_info":
+        if (msg.sessionId === currentSessionId) {
+          updateContextBar(msg.currentTokens, msg.tokenLimit);
         }
         break;
 
@@ -329,6 +359,10 @@
           finishStreaming();
         }
         break;
+
+      case "diff_result":
+        renderDiffResult(msg);
+        break;
     }
   }
 
@@ -347,6 +381,9 @@
     if (!currentSessionId) {
       headerCwd.textContent = "";
       headerModelSelect.style.display = "none";
+      diffBtn.style.display = "none";
+    } else {
+      diffBtn.style.display = "";
     }
   }
 
@@ -474,6 +511,7 @@
     bubble.innerHTML = renderMarkdown(markdown);
     div.appendChild(bubble);
     messagesEl.appendChild(div);
+    highlightRenderedCode(bubble);
     addCopyButtons(bubble);
     scrollToBottom();
   }
@@ -545,6 +583,7 @@
 
     streamingBuffer += text;
     streamingBubble.innerHTML = renderMarkdown(streamingBuffer);
+    highlightRenderedCode(streamingBubble);
     addCopyButtons(streamingBubble);
     scrollToBottom();
   }
@@ -553,9 +592,18 @@
     if (streamingBubble) {
       streamingBubble.classList.remove("streaming-cursor");
       streamingBubble.innerHTML = renderMarkdown(streamingBuffer);
+      highlightRenderedCode(streamingBubble);
       addCopyButtons(streamingBubble);
       streamingBubble = null;
       streamingBuffer = "";
+    }
+    // Finalize any still-streaming reasoning blocks
+    for (const [, rb] of reasoningBlocks) {
+      if (rb.streaming) {
+        rb.streaming = false;
+        const statusEl = rb.block.querySelector(".reasoning-status");
+        if (statusEl) statusEl.textContent = "done";
+      }
     }
     isStreaming = false;
     updateSendState();
@@ -574,24 +622,99 @@
     }
   }
 
+  // ── Reasoning blocks ──
+
+  function appendReasoningDelta(reasoningId, delta) {
+    let rb = reasoningBlocks.get(reasoningId);
+    if (!rb) {
+      const block = document.createElement("div");
+      block.className = "reasoning-block expanded";
+      block.innerHTML = `
+        <div class="reasoning-header" onclick="this.parentElement.classList.toggle('expanded')">
+          <span class="reasoning-icon">🧠</span>
+          <span class="reasoning-label">Thinking</span>
+          <span class="reasoning-status"><span class="spinner"></span></span>
+          <span class="reasoning-chevron">▶</span>
+        </div>
+        <div class="reasoning-body">
+          <div class="reasoning-content"></div>
+        </div>`;
+      messagesEl.appendChild(block);
+      const contentEl = block.querySelector(".reasoning-content");
+      rb = { block, contentEl, streaming: true };
+      reasoningBlocks.set(reasoningId, rb);
+      scrollToBottom();
+    }
+    rb.contentEl.textContent += delta;
+    // Auto-scroll reasoning body if expanded
+    const body = rb.block.querySelector(".reasoning-body");
+    if (body) body.scrollTop = body.scrollHeight;
+  }
+
+  function finalizeReasoning(reasoningId, content) {
+    let rb = reasoningBlocks.get(reasoningId);
+    if (!rb) {
+      // Received complete event without deltas (non-streaming path) — create it
+      appendReasoningDelta(reasoningId, "");
+      rb = reasoningBlocks.get(reasoningId);
+    }
+    if (rb) {
+      rb.contentEl.textContent = content || rb.contentEl.textContent;
+      rb.streaming = false;
+      const statusEl = rb.block.querySelector(".reasoning-status");
+      if (statusEl) statusEl.textContent = "done";
+      // Collapse after done so it's out of the way
+      rb.block.classList.remove("expanded");
+    }
+  }
+
+  // ── Context window bar ──
+
+  function updateContextBar(currentTokens, tokenLimit) {
+    if (!tokenLimit) return;
+    const pct = Math.min(currentTokens / tokenLimit, 1);
+    const pctDisplay = Math.round(pct * 100);
+    contextBar.style.display = "";
+    contextBarFill.style.width = `${pct * 100}%`;
+    // Color: green → yellow → red
+    const color = pct < 0.6 ? "var(--success)" : pct < 0.85 ? "#e0a020" : "var(--danger)";
+    contextBarFill.style.background = color;
+    contextBarLabel.textContent = `${pctDisplay}% · ${formatTokens(currentTokens)} / ${formatTokens(tokenLimit)}`;
+  }
+
+  function formatTokens(n) {
+    return n >= 1000 ? `${(n / 1000).toFixed(0)}k` : String(n);
+  }
+
   // ── Tool call rendering ──
+
+  // Tools that render as a simple inline text line (no expandable box)
+  const INLINE_TOOLS = new Set([
+    "read_file", "view",
+    "edit", "edit_file", "replace_string_in_file", "multi_replace_string_in_file",
+    "create", "create_file", "delete_file",
+  ]);
 
   // Lookup for tool display info: { icon, label(args), resultLabel }
   const TOOL_DISPLAY = {
     read_file:      { icon: "📄", label: a => `Read ${shortPath(a.filePath || a.path || a.file || "")}` },
-    edit_file:      { icon: "✏️", label: a => `Edit ${shortPath(a.filePath || a.path || a.file || "")}` },
-    create_file:    { icon: "📝", label: a => `Create ${shortPath(a.filePath || a.path || a.file || "")}` },
-    replace_string_in_file: { icon: "✏️", label: a => `Edit ${shortPath(a.filePath || "")}` },
-    multi_replace_string_in_file: { icon: "✏️", label: a => `Multi-edit files` },
-    delete_file:    { icon: "🗑️", label: a => `Delete ${shortPath(a.filePath || a.path || "")}` },
+    view:           { icon: "📄", label: a => `Read ${shortPath(a.path || a.filePath || a.file || "")}` },
+    edit:           { icon: "✏️", label: a => `Edited ${shortPath(a.filePath || a.path || a.file || a.old_str && "(file)" || "")}` },
+    edit_file:      { icon: "✏️", label: a => `Edited ${shortPath(a.filePath || a.path || a.file || "")}` },
+    create:         { icon: "📝", label: a => `Created ${shortPath(a.path || a.filePath || a.file || "")}` },
+    create_file:    { icon: "📝", label: a => `Created ${shortPath(a.filePath || a.path || a.file || "")}` },
+    replace_string_in_file: { icon: "✏️", label: a => `Edited ${shortPath(a.filePath || "")}` },
+    multi_replace_string_in_file: { icon: "✏️", label: a => `Edited files` },
+    delete_file:    { icon: "🗑️", label: a => `Deleted ${shortPath(a.filePath || a.path || "")}` },
     list_dir:       { icon: "📁", label: a => `List ${shortPath(a.path || a.directory || "")}` },
     list_directory: { icon: "📁", label: a => `List ${shortPath(a.path || a.directory || "")}` },
     grep_search:    { icon: "🔍", label: a => `Search: ${truncate(a.query || a.pattern || "", 60)}` },
+    grep:           { icon: "🔍", label: a => `Search: ${truncate(a.pattern || a.query || "", 60)}` },
     file_search:    { icon: "🔍", label: a => `Find files: ${truncate(a.query || a.pattern || "", 60)}` },
     semantic_search:{ icon: "🔍", label: a => `Search: ${truncate(a.query || "", 60)}` },
-    run_in_terminal:{ icon: "⚡", label: a => `Run command` },
-    powershell:     { icon: "⚡", label: a => `Run command` },
-    shell:          { icon: "⚡", label: a => `Run command` },
+    run_in_terminal:{ icon: "⚡", label: a => truncate(a.command || a.cmd || "Run command", 80) },
+    powershell:     { icon: "⚡", label: a => truncate(a.command || a.cmd || "Run command", 80) },
+    shell:          { icon: "⚡", label: a => truncate(a.command || a.cmd || "Run command", 80) },
     report_intent:  { icon: "💡", label: a => `${truncate(a.intention || a.intent || "Thinking...", 80)}` },
     fetch_copilot_cli_documentation: { icon: "📚", label: () => "Reading docs" },
     get_errors:     { icon: "⚠️", label: a => `Check errors${a.filePaths ? ": " + shortPath(a.filePaths[0] || "") : ""}` },
@@ -632,14 +755,33 @@
     const icon = display?.icon || "⚡";
     const label = display?.label?.(parsedArgs) || name;
 
+    // report_intent: show as a plain italic status line, no box
+    if (normalizedName === "report_intent") {
+      const intentText = parsedArgs.intention || parsedArgs.intent || intention || "Thinking...";
+      const el = document.createElement("div");
+      el.className = "intent-line";
+      el.id = `tool-${callId}`;
+      el.textContent = intentText;
+      messagesEl.appendChild(el);
+      scrollToBottom();
+      return;
+    }
+
+    // File read/edit tools: render as a simple inline text line, no expandable box
+    if (INLINE_TOOLS.has(normalizedName)) {
+      const el = document.createElement("div");
+      el.className = "tool-inline";
+      el.id = `tool-${callId}`;
+      el.dataset.toolName = normalizedName;
+      el.innerHTML = `<span class="tool-inline-icon">${icon}</span><span>${escapeHtml(label)}</span>`;
+      messagesEl.appendChild(el);
+      scrollToBottom();
+      return;
+    }
+
     // Build compact summary line for command-like tools
     let summaryHtml = "";
-    if (normalizedName === "run_in_terminal" || normalizedName === "powershell" || normalizedName === "shell") {
-      const cmd = parsedArgs.command || parsedArgs.cmd || "";
-      if (cmd) {
-        summaryHtml = `<div class="tool-command"><code>${escapeHtml(truncate(cmd, 200))}</code></div>`;
-      }
-    } else if (intention) {
+    if (intention) {
       summaryHtml = `<div class="tool-intention">${escapeHtml(intention)}</div>`;
     }
 
@@ -684,8 +826,9 @@
         return `File: ${args.filePath || args.path || "?"}\n${args.oldString ? "Replace: " + truncate(args.oldString, 100) + "\nWith: " + truncate(args.newString || "", 100) : ""}`;
       case "create_file":
         return `File: ${args.filePath || args.path || "?"}\nContent: ${truncate(args.content || "", 200)}`;
+      case "grep":
       case "grep_search":
-        return `Query: ${args.query || args.pattern || "?"}\nPath: ${args.includePattern || "all files"}`;
+        return `Pattern: ${args.pattern || args.query || "?"}\nPath: ${args.path || args.includePattern || "all files"}`;
       case "run_in_terminal":
       case "powershell":
       case "shell":
@@ -758,8 +901,8 @@
     const toolCallId = msg.toolCallId;
     let block = toolCallId ? document.getElementById(`tool-${toolCallId}`) : null;
     if (!block) {
-      // Find last running tool block
-      const blocks = messagesEl.querySelectorAll(".tool-block:not(.tool-done)");
+      // Find last running tool block or inline element
+      const blocks = messagesEl.querySelectorAll(".tool-block:not(.tool-done), .tool-inline");
       if (blocks.length > 0) block = blocks[blocks.length - 1];
     }
     if (!block) return;
@@ -784,10 +927,27 @@
 
     // Update file name for write/edit tools
     if (msg.fileName && (msg.kind === "write" || msg.kind === "edit")) {
-      const nameEl = block.querySelector(".tool-name");
-      if (nameEl) {
-        const icon = block.querySelector(".tool-icon")?.textContent || "✏️";
-        nameEl.textContent = `Edit ${shortPath(msg.fileName)}`;
+      // Inline tool (no box)
+      const inlineSpan = block.querySelector("span:last-child");
+      if (block.classList.contains("tool-inline") && inlineSpan) {
+        inlineSpan.textContent = `Edited ${shortPath(msg.fileName)}`;
+      } else {
+        const nameEl = block.querySelector(".tool-name");
+        if (nameEl) nameEl.textContent = `Edited ${shortPath(msg.fileName)}`;
+      }
+    }
+
+    // Diff stats (+N -N) for inline edit elements
+    if (msg.diff && block.classList.contains("tool-inline")) {
+      const lines = msg.diff.split("\n");
+      const added = lines.filter(l => l.startsWith("+") && !l.startsWith("+++")).length;
+      const removed = lines.filter(l => l.startsWith("-") && !l.startsWith("---")).length;
+      if ((added || removed) && !block.querySelector(".diff-stats")) {
+        const stats = document.createElement("span");
+        stats.className = "diff-stats";
+        stats.innerHTML = (added ? `<span class="diff-add">+${added}</span>` : "") +
+                          (removed ? `<span class="diff-del">-${removed}</span>` : "");
+        block.appendChild(stats);
       }
     }
 
@@ -828,9 +988,9 @@
 
   function renderMarkdown(text) {
     try {
-      const raw = marked.parse(text);
-      return DOMPurify.sanitize(raw);
-    } catch {
+      return marked.parse(text);
+    } catch(e) {
+      console.error("[markdown] render error:", e);
       return escapeHtml(text);
     }
   }
@@ -872,6 +1032,8 @@
   function updateSendState() {
     const hasContent = messageInput.value.trim().length > 0;
     sendBtn.disabled = !hasContent || isStreaming || !currentSessionId;
+    sendBtn.style.display = isStreaming ? "none" : "";
+    stopBtn.style.display = isStreaming ? "" : "none";
   }
 
   function handleSend() {
@@ -943,6 +1105,12 @@
 
   sendBtn.addEventListener("click", handleSend);
 
+  stopBtn.addEventListener("click", () => {
+    if (currentSessionId) {
+      wsSend({ type: "abort", sessionId: currentSessionId });
+    }
+  });
+
   messageInput.addEventListener("input", () => {
     autoResizeTextarea();
     updateSendState();
@@ -954,6 +1122,150 @@
       handleSend();
     }
   });
+
+  // ── Diff panel ──
+
+  function openDiffPanel() {
+    diffPanel.style.display = "flex";
+    diffOverlay.style.display = "block";
+    diffContentEl.innerHTML = '<div class="diff-loading">Loading diff…</div>';
+    diffStatEl.textContent = "";
+    wsSend({ type: "get_diff", sessionId: currentSessionId });
+  }
+
+  function closeDiffPanel() {
+    diffPanel.style.display = "none";
+    diffOverlay.style.display = "none";
+  }
+
+  diffBtn.addEventListener("click", openDiffPanel);
+  diffCloseBtn.addEventListener("click", closeDiffPanel);
+  diffOverlay.addEventListener("click", closeDiffPanel);
+  diffRefreshBtn.addEventListener("click", () => {
+    diffContentEl.innerHTML = '<div class="diff-loading">Loading diff…</div>';
+    diffStatEl.textContent = "";
+    wsSend({ type: "get_diff", sessionId: currentSessionId });
+  });
+
+  function renderDiffResult(msg) {
+    if (msg.error) {
+      diffContentEl.innerHTML = `<div class="diff-empty">Error: ${escapeHtml(msg.error)}</div>`;
+      return;
+    }
+    if (!msg.diff || !msg.diff.trim()) {
+      diffContentEl.innerHTML = '<div class="diff-empty">No local changes</div>';
+      diffStatEl.textContent = "";
+      return;
+    }
+
+    diffStatEl.textContent = msg.stat || "";
+
+    // Parse unified diff into file sections
+    const files = parseDiff(msg.diff);
+    diffContentEl.innerHTML = "";
+
+    for (const file of files) {
+      const section = document.createElement("div");
+      section.className = "diff-file expanded";
+
+      // Count additions/deletions
+      let added = 0, removed = 0;
+      for (const line of file.lines) {
+        if (line.type === "added") added++;
+        else if (line.type === "removed") removed++;
+      }
+
+      const header = document.createElement("div");
+      header.className = "diff-file-header";
+      header.innerHTML = `
+        <span class="diff-file-chevron">▶</span>
+        <span class="diff-file-name">${escapeHtml(file.name)}</span>
+        <span class="diff-file-stats">
+          ${added ? `<span class="diff-add">+${added}</span>` : ""}
+          ${removed ? `<span class="diff-del">-${removed}</span>` : ""}
+        </span>
+      `;
+      header.onclick = () => section.classList.toggle("expanded");
+      section.appendChild(header);
+
+      const body = document.createElement("div");
+      body.className = "diff-file-body";
+
+      for (const line of file.lines) {
+        if (line.type === "hunk") {
+          const hunk = document.createElement("div");
+          hunk.className = "diff-hunk-header";
+          hunk.textContent = line.content;
+          body.appendChild(hunk);
+        } else {
+          const row = document.createElement("div");
+          row.className = `diff-line ${line.type}`;
+
+          const numOld = document.createElement("span");
+          numOld.className = "diff-line-number";
+          numOld.textContent = line.oldNum ?? "";
+
+          const numNew = document.createElement("span");
+          numNew.className = "diff-line-number";
+          numNew.textContent = line.newNum ?? "";
+
+          const content = document.createElement("span");
+          content.className = "diff-line-content";
+          content.textContent = line.content;
+
+          row.appendChild(numOld);
+          row.appendChild(numNew);
+          row.appendChild(content);
+          body.appendChild(row);
+        }
+      }
+
+      section.appendChild(body);
+      diffContentEl.appendChild(section);
+    }
+  }
+
+  function parseDiff(raw) {
+    const files = [];
+    let current = null;
+    let oldLine = 0, newLine = 0;
+
+    for (const line of raw.split("\n")) {
+      if (line.startsWith("diff --git")) {
+        // Extract filename from "diff --git a/path b/path"
+        const match = line.match(/b\/(.+)$/);
+        current = { name: match ? match[1] : line, lines: [] };
+        files.push(current);
+        continue;
+      }
+      if (!current) continue;
+
+      if (line.startsWith("---") || line.startsWith("+++") || line.startsWith("index ")) {
+        continue; // skip meta lines
+      }
+
+      if (line.startsWith("@@")) {
+        // Parse hunk header: @@ -oldStart,count +newStart,count @@
+        const hunkMatch = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        if (hunkMatch) {
+          oldLine = parseInt(hunkMatch[1]);
+          newLine = parseInt(hunkMatch[2]);
+        }
+        current.lines.push({ type: "hunk", content: line });
+        continue;
+      }
+
+      if (line.startsWith("+")) {
+        current.lines.push({ type: "added", content: line.substring(1), newNum: newLine++ });
+      } else if (line.startsWith("-")) {
+        current.lines.push({ type: "removed", content: line.substring(1), oldNum: oldLine++ });
+      } else if (line.startsWith(" ")) {
+        current.lines.push({ type: "context", content: line.substring(1), oldNum: oldLine++, newNum: newLine++ });
+      }
+    }
+
+    return files;
+  }
 
   // ── Init ──
 

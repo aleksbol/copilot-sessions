@@ -11,7 +11,6 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/DOMPurify/3.1.6/purify.min.js"></script>
 </head>
 <body>
   <!-- Sidebar -->
@@ -56,6 +55,11 @@
         <span id="header-cwd" class="header-cwd" title="Working directory"></span>
         <select id="header-model-select" class="header-model-select" title="Change model" style="display:none">
         </select>
+        <button id="diff-btn" class="btn-icon diff-btn" title="View local changes" style="display:none">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M11.93 8.5a4.002 4.002 0 0 1-7.86 0H.75a.75.75 0 0 1 0-1.5h3.32a4.002 4.002 0 0 1 7.86 0h3.32a.75.75 0 0 1 0 1.5Zm-1.43-.75a2.5 2.5 0 1 0-5 0 2.5 2.5 0 0 0 5 0Z"/>
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -74,6 +78,11 @@
           rows="1"
           autocomplete="off"
         ></textarea>
+        <button id="stop-btn" class="stop-btn" style="display:none" title="Stop generating">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <rect x="3" y="3" width="10" height="10" rx="2"/>
+          </svg>
+        </button>
         <button id="send-btn" class="send-btn" disabled title="Send">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M22 2L11 13"></path>
@@ -81,8 +90,28 @@
           </svg>
         </button>
       </div>
+      <div id="context-bar" class="context-bar" style="display:none">
+        <div class="context-bar-track">
+          <div id="context-bar-fill" class="context-bar-fill"></div>
+        </div>
+        <span id="context-bar-label" class="context-bar-label"></span>
+      </div>
     </footer>
   </main>
+
+  <!-- Diff panel -->
+  <div id="diff-panel" class="diff-panel" style="display:none">
+    <div class="diff-panel-header">
+      <h2>Local Changes</h2>
+      <div class="diff-panel-actions">
+        <button id="diff-refresh-btn" class="btn-icon" title="Refresh">↻</button>
+        <button id="diff-close-btn" class="btn-icon" title="Close">✕</button>
+      </div>
+    </div>
+    <div id="diff-stat" class="diff-stat"></div>
+    <div id="diff-content" class="diff-content"></div>
+  </div>
+  <div id="diff-overlay" class="diff-overlay" style="display:none"></div>
 
   <script src="/app.js"></script>
 </body>
