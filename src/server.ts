@@ -914,12 +914,12 @@ function eventsToHistory(events: SessionEvent[]): any[] {
 
 // ── Start ──
 
-server.listen(PORT, () => {
+server.listen(PORT, "127.0.0.1", () => {
   console.log(`
 🚀 Copilot Sessions bridge running!
    ─────────────────────────────────
-   Web UI:     http://localhost:${PORT}
-   WebSocket:  ws://localhost:${PORT}/ws
+   Web UI:     http://127.0.0.1:${PORT}
+   WebSocket:  ws://127.0.0.1:${PORT}/ws
    Default CWD:   ${DEFAULT_CWD}
    Default model: ${defaultModel || '(auto-detect on first use)'}
 
