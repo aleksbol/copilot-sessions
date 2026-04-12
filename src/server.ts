@@ -51,9 +51,10 @@ async function ensureClient() {
 const activeSessions = new Map<string, CopilotSession>();
 
 // Per-session metadata (model) — persisted to disk so it survives restarts.
-// cwd is NOT stored here; it comes from the SDK's SessionMetadata.context.cwd.
+// cwd is stored as a fallback cache; the SDK's SessionMetadata.context.cwd is
+// the preferred source (so sessions created by the CLI are handled correctly).
 const SESSION_META_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "session-meta.json");
-const sessionMeta = new Map<string, { model: string }>();
+const sessionMeta = new Map<string, { model: string; cwd?: string }>();
 
 function loadSessionMeta() {
   try {
@@ -61,7 +62,7 @@ function loadSessionMeta() {
       const data = JSON.parse(fs.readFileSync(SESSION_META_FILE, "utf-8"));
       for (const [k, v] of Object.entries(data)) {
         const entry = v as { model?: string; cwd?: string };
-        sessionMeta.set(k, { model: entry.model ?? "" });
+        sessionMeta.set(k, { model: entry.model ?? "", cwd: entry.cwd });
       }
       console.log(`[meta] loaded ${sessionMeta.size} session(s) from disk`);
     }
@@ -72,7 +73,7 @@ function loadSessionMeta() {
 
 function saveSessionMeta() {
   try {
-    const obj: Record<string, { model: string }> = {};
+    const obj: Record<string, { model: string; cwd?: string }> = {};
     for (const [k, v] of sessionMeta) obj[k] = v;
     fs.writeFileSync(SESSION_META_FILE, JSON.stringify(obj, null, 2));
   } catch (e: any) {
@@ -80,15 +81,15 @@ function saveSessionMeta() {
   }
 }
 
-/** Fetch the working directory for a session from the SDK. */
+/** Fetch the working directory for a session. Prefers SDK metadata, falls back to local cache. */
 async function getSessionCwd(sessionId: string): Promise<string> {
   try {
     const sdkMeta = await copilot.getSessionMetadata(sessionId);
-    return sdkMeta?.context?.cwd ?? "";
+    if (sdkMeta?.context?.cwd) return sdkMeta.context.cwd;
   } catch (e: any) {
     console.warn(`[meta] could not fetch cwd for ${sessionId}: ${e.message}`);
-    return "";
   }
+  return sessionMeta.get(sessionId)?.cwd ?? "";
 }
 
 loadSessionMeta();
@@ -516,7 +517,7 @@ wss.on("connection", (ws: any) => {
           session.registerUserInputHandler(createUserInputHandler(sessionId));
           session.registerElicitationHandler(createElicitationHandler(sessionId));
           activeSessions.set(sessionId, session);
-          sessionMeta.set(sessionId, { model });
+          sessionMeta.set(sessionId, { model, cwd });
           saveSessionMeta();
           bindSessionEvents(session, sessionId);
           subscribeToSession(ws, sessionId);
