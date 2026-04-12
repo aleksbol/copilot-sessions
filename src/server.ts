@@ -675,7 +675,24 @@ wss.on("connection", (ws: any) => {
           // Subscribe this client to the session's broadcasts
           subscribeToSession(ws, sessionId);
 
-          // Meta is loaded from disk; no-op if already known
+          // If we don't have metadata for this session (e.g. it was created
+          // by the Copilot CLI, not by this tool), pull it from the SDK so
+          // that cwd-dependent features like git-diff work correctly.
+          if (!sessionMeta.has(sessionId)) {
+            try {
+              const sdkMeta = await copilot.getSessionMetadata(sessionId);
+              if (sdkMeta?.context?.cwd) {
+                sessionMeta.set(sessionId, {
+                  cwd: sdkMeta.context.cwd,
+                  model: msg.model ?? defaultModel,
+                });
+                saveSessionMeta();
+                console.log(`[meta] populated from SDK: cwd=${sdkMeta.context.cwd}`);
+              }
+            } catch (e: any) {
+              console.warn(`[meta] could not fetch SDK metadata: ${e.message}`);
+            }
+          }
 
           // Fetch and send history
           try {
