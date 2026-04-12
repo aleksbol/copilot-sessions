@@ -50,16 +50,18 @@ async function ensureClient() {
 // Track active SDK sessions: sessionId → CopilotSession
 const activeSessions = new Map<string, CopilotSession>();
 
-// Per-session metadata (cwd, model) — persisted to disk so it survives restarts
+// Per-session metadata (model) — persisted to disk so it survives restarts.
+// cwd is NOT stored here; it comes from the SDK's SessionMetadata.context.cwd.
 const SESSION_META_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "session-meta.json");
-const sessionMeta = new Map<string, { cwd: string; model: string }>();
+const sessionMeta = new Map<string, { model: string }>();
 
 function loadSessionMeta() {
   try {
     if (fs.existsSync(SESSION_META_FILE)) {
       const data = JSON.parse(fs.readFileSync(SESSION_META_FILE, "utf-8"));
       for (const [k, v] of Object.entries(data)) {
-        sessionMeta.set(k, v as { cwd: string; model: string });
+        const entry = v as { model?: string; cwd?: string };
+        sessionMeta.set(k, { model: entry.model ?? "" });
       }
       console.log(`[meta] loaded ${sessionMeta.size} session(s) from disk`);
     }
@@ -70,11 +72,22 @@ function loadSessionMeta() {
 
 function saveSessionMeta() {
   try {
-    const obj: Record<string, { cwd: string; model: string }> = {};
+    const obj: Record<string, { model: string }> = {};
     for (const [k, v] of sessionMeta) obj[k] = v;
     fs.writeFileSync(SESSION_META_FILE, JSON.stringify(obj, null, 2));
   } catch (e: any) {
     console.warn(`[meta] failed to save: ${e.message}`);
+  }
+}
+
+/** Fetch the working directory for a session from the SDK. */
+async function getSessionCwd(sessionId: string): Promise<string> {
+  try {
+    const sdkMeta = await copilot.getSessionMetadata(sessionId);
+    return sdkMeta?.context?.cwd ?? "";
+  } catch (e: any) {
+    console.warn(`[meta] could not fetch cwd for ${sessionId}: ${e.message}`);
+    return "";
   }
 }
 
@@ -503,7 +516,7 @@ wss.on("connection", (ws: any) => {
           session.registerUserInputHandler(createUserInputHandler(sessionId));
           session.registerElicitationHandler(createElicitationHandler(sessionId));
           activeSessions.set(sessionId, session);
-          sessionMeta.set(sessionId, { cwd, model });
+          sessionMeta.set(sessionId, { model });
           saveSessionMeta();
           bindSessionEvents(session, sessionId);
           subscribeToSession(ws, sessionId);
@@ -632,7 +645,7 @@ wss.on("connection", (ws: any) => {
             return {
               sessionId: s.sessionId ?? s.id,
               title: s.title ?? s.name ?? "Session",
-              cwd: meta?.cwd ?? s.context?.cwd ?? s.cwd ?? "",
+              cwd: s.context?.cwd ?? "",
               model: meta?.model ?? s.model ?? "",
               createdAt: s.startTime ?? s.createdAt ?? "",
               updatedAt: s.lastActiveTime ?? s.updatedAt ?? "",
@@ -675,25 +688,6 @@ wss.on("connection", (ws: any) => {
           // Subscribe this client to the session's broadcasts
           subscribeToSession(ws, sessionId);
 
-          // If we don't have metadata for this session (e.g. it was created
-          // by the Copilot CLI, not by this tool), pull it from the SDK so
-          // that cwd-dependent features like git-diff work correctly.
-          if (!sessionMeta.has(sessionId)) {
-            try {
-              const sdkMeta = await copilot.getSessionMetadata(sessionId);
-              if (sdkMeta?.context?.cwd) {
-                sessionMeta.set(sessionId, {
-                  cwd: sdkMeta.context.cwd,
-                  model: msg.model ?? defaultModel,
-                });
-                saveSessionMeta();
-                console.log(`[meta] populated from SDK: cwd=${sdkMeta.context.cwd}`);
-              }
-            } catch (e: any) {
-              console.warn(`[meta] could not fetch SDK metadata: ${e.message}`);
-            }
-          }
-
           // Fetch and send history
           try {
             const events = await session.getMessages();
@@ -705,13 +699,14 @@ wss.on("connection", (ws: any) => {
           }
 
           const meta = sessionMeta.get(sessionId);
+          const cwd = await getSessionCwd(sessionId);
           send(ws, {
             type: "session_resumed",
             sessionId,
-            cwd: meta?.cwd ?? "",
+            cwd,
             model: meta?.model ?? "",
           });
-          console.log(`[session] resumed: ${sessionId}, cwd=${meta?.cwd}, model=${meta?.model}`);
+          console.log(`[session] resumed: ${sessionId}, cwd=${cwd}, model=${meta?.model}`);
           break;
         }
 
@@ -735,7 +730,7 @@ wss.on("connection", (ws: any) => {
             return {
               sessionId: s.sessionId ?? s.id,
               title: s.title ?? s.name ?? "Session",
-              cwd: meta2?.cwd ?? s.context?.cwd ?? s.cwd ?? "",
+              cwd: s.context?.cwd ?? "",
               model: meta2?.model ?? s.model ?? "",
               createdAt: s.startTime ?? s.createdAt ?? "",
               updatedAt: s.lastActiveTime ?? s.updatedAt ?? "",
@@ -786,8 +781,18 @@ wss.on("connection", (ws: any) => {
 
         // ── Git diff for workspace ──
         case "get_diff": {
-          const meta = sessionMeta.get(msg.sessionId);
-          const cwd = meta?.cwd || DEFAULT_CWD;
+          const cwd = await getSessionCwd(msg.sessionId);
+          if (!cwd) {
+            send(ws, {
+              type: "diff_result",
+              sessionId: msg.sessionId,
+              diff: "",
+              stat: "",
+              error: "Could not determine workspace directory for this session",
+              cwd: "",
+            });
+            break;
+          }
           try {
             // git diff HEAD shows both staged and unstaged vs last commit
             const diff = execSync("git diff HEAD", {
