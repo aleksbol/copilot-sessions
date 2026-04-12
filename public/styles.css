@@ -1079,6 +1079,18 @@ body {
   background: var(--success);
 }
 
+#disconnect-banner {
+  display: none;
+  background: var(--danger);
+  color: #fff;
+  text-align: center;
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  z-index: 10;
+  flex-shrink: 0;
+}
+
 /* ── Prompt cards (user input / elicitation) ── */
 
 .prompt-card {

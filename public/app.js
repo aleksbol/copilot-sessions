@@ -91,7 +91,18 @@
       console.log("[ws] connected");
       reconnectAttempts = 0;
       updateConnectionStatus(true);
+      startHeartbeat();
+      // Reset streaming state on reconnect — if the turn finished while we were
+      // disconnected, we won't get another turn_end
+      isStreaming = false;
+      hideThinkingIndicator();
+      updateSendState();
       wsSend({ type: "list_sessions" });
+      // Re-fetch current session history to pick up messages missed while disconnected
+      if (currentSessionId) {
+        console.log("[ws] reconnected — re-fetching session history");
+        wsSend({ type: "resume_session", sessionId: currentSessionId });
+      }
     };
 
     newWs.onmessage = (event) => {
@@ -107,6 +118,7 @@
     newWs.onclose = () => {
       if (ws !== newWs) return; // already replaced
       console.log("[ws] disconnected");
+      stopHeartbeat();
       updateConnectionStatus(false);
       scheduleReconnect();
     };
@@ -127,6 +139,99 @@
     }, delay);
   }
 
+  // Client-side heartbeat: send a ping every 25s, expect pong within 10s
+  let heartbeatInterval = null;
+  let heartbeatTimeout = null;
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        wsSend({ type: "ping" });
+        heartbeatTimeout = setTimeout(() => {
+          console.log("[ws] heartbeat timeout — forcing reconnect");
+          if (ws) { try { ws.close(); } catch {} }
+        }, 10000);
+      }
+    }, 25000);
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+    if (heartbeatTimeout) { clearTimeout(heartbeatTimeout); heartbeatTimeout = null; }
+  }
+
+  function onPong() {
+    if (heartbeatTimeout) { clearTimeout(heartbeatTimeout); heartbeatTimeout = null; }
+    if (visibilityProbeTimeout) { clearTimeout(visibilityProbeTimeout); visibilityProbeTimeout = null; }
+    lastPongTime = Date.now();
+  }
+
+  // Reconnect when tab regains focus — always verify with a ping
+  // because readyState can still say OPEN on a dead connection after phone sleep
+  let visibilityProbeTimeout = null;
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      if (visibilityProbeTimeout) { clearTimeout(visibilityProbeTimeout); visibilityProbeTimeout = null; }
+
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        console.log("[ws] tab visible — connection dead, reconnecting");
+        connect();
+      } else {
+        // Connection *looks* alive — verify with a quick ping
+        console.log("[ws] tab visible — verifying connection...");
+        wsSend({ type: "ping" });
+        visibilityProbeTimeout = setTimeout(() => {
+          visibilityProbeTimeout = null;
+          console.log("[ws] tab visible — ping timeout, forcing reconnect");
+          stopHeartbeat();
+          if (ws) { try { ws.close(); } catch {} ws = null; }
+          updateConnectionStatus(false);
+          connect();
+        }, 5000);
+      }
+    }
+  });
+
+  // ── Connection watchdog ──
+  // Runs every 3s. When phone sleeps, timers freeze; on wake the callback fires
+  // and detects the gap. This catches cases visibilitychange misses.
+  let lastPongTime = Date.now();
+  let lastWatchdogTime = Date.now();
+
+  setInterval(() => {
+    const now = Date.now();
+    const elapsed = now - lastWatchdogTime;
+    lastWatchdogTime = now;
+
+    // If >10s elapsed since last tick, we probably just woke from sleep
+    const wokeFromSleep = elapsed > 10000;
+
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      updateConnectionStatus(false);
+      if (!reconnectTimer) {
+        console.log("[watchdog] connection dead, reconnecting");
+        connect();
+      }
+    } else if (wokeFromSleep && ws.readyState === WebSocket.OPEN) {
+      // Just woke up — force a probe
+      console.log(`[watchdog] woke from sleep (${Math.round(elapsed/1000)}s gap), probing...`);
+      wsSend({ type: "ping" });
+      // Give it 5s to respond, otherwise force reconnect
+      if (!visibilityProbeTimeout) {
+        visibilityProbeTimeout = setTimeout(() => {
+          visibilityProbeTimeout = null;
+          console.log("[watchdog] ping timeout after wake, forcing reconnect");
+          stopHeartbeat();
+          if (ws) { try { ws.close(); } catch {} ws = null; }
+          updateConnectionStatus(false);
+          connect();
+        }, 5000);
+      }
+    }
+  }, 3000);
+
   function wsSend(msg) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ ...msg, clientId: CLIENT_ID }));
@@ -142,6 +247,21 @@
     }
     dot.classList.toggle("connected", connected);
     dot.title = connected ? "Connected" : "Disconnected";
+
+    // Show/hide a disconnected banner at the top of the chat
+    let banner = document.getElementById("disconnect-banner");
+    if (!connected) {
+      if (!banner) {
+        banner = document.createElement("div");
+        banner.id = "disconnect-banner";
+        banner.textContent = "Disconnected — reconnecting…";
+        const chatArea = document.querySelector(".chat-messages");
+        chatArea.parentNode.insertBefore(banner, chatArea);
+      }
+      banner.style.display = "block";
+    } else if (banner) {
+      banner.style.display = "none";
+    }
   }
 
   // ── Server event handlers ──
@@ -165,6 +285,9 @@
       }
     }
     switch (msg.type) {
+      case "pong":
+        onPong();
+        return;
       case "session_list":
         sessions = msg.sessions || [];
         renderSessionList();

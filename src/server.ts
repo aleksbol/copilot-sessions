@@ -441,10 +441,27 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
 
 // ── WebSocket message handler ──
 
-wss.on("connection", (ws) => {
-  console.log("[ws] client connected");
+// Server-side heartbeat: ping every client every 30s, terminate if no pong within 10s
+const HEARTBEAT_INTERVAL = 30_000;
+const HEARTBEAT_TIMEOUT = 10_000;
 
-  ws.on("message", async (raw) => {
+setInterval(() => {
+  wss.clients.forEach((ws: any) => {
+    if (ws.isAlive === false) {
+      console.log("[ws] terminating unresponsive client");
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_INTERVAL);
+
+wss.on("connection", (ws: any) => {
+  console.log("[ws] client connected");
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+
+  ws.on("message", async (raw: any) => {
     let msg: any;
     try {
       msg = JSON.parse(raw.toString());
@@ -460,6 +477,11 @@ wss.on("connection", (ws) => {
 
     try {
       switch (msg.type) {
+        // ── Heartbeat ──
+        case "ping":
+          send(ws, { type: "pong" });
+          return;
+
         // ── Create new session ──
         case "new_session": {
           await ensureClient();
