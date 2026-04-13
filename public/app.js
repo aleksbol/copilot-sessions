@@ -402,7 +402,11 @@
       case "tool_start":
         if (msg.sessionId === currentSessionId) {
           hideThinkingIndicator();
-          appendToolStart(msg.name, msg.args, msg.callId, msg.intention);
+          // Skip ask_user live — the elicitation_request handler renders the interactive card
+          const tsToolName = (msg.name || "").toLowerCase().replace(/[^a-z0-9_]/g, "_");
+          if (tsToolName !== "ask_user") {
+            appendToolStart(msg.name, msg.args, msg.callId, msg.intention);
+          }
         }
         break;
 
