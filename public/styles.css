@@ -1583,6 +1583,10 @@ body {
   background: #f85149;
 }
 
+.process-status-dot.detached {
+  background: #d2a8ff;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }

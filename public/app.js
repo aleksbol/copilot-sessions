@@ -1669,7 +1669,7 @@
 
       const meta = document.createElement("div");
       meta.className = "process-meta";
-      const statusLabel = proc.status === "running" ? "Running" : proc.status === "done" ? "Completed" : "Failed";
+      const statusLabel = proc.status === "running" ? "Running" : proc.status === "done" ? "Completed" : proc.status === "detached" ? "Detached" : "Failed";
       const duration = formatDuration(proc.startedAt, proc.completedAt);
       meta.innerHTML = `<span>${statusLabel}</span><span>${formatProcessTime(proc.startedAt)}</span>${duration ? `<span>${duration}</span>` : ""}`;
 

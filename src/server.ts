@@ -143,7 +143,7 @@ interface TrackedProcess {
   name: string;         // tool name (e.g. "powershell", "bash")
   command: string;      // the command that was run
   intention: string;    // AI's stated intention
-  status: "running" | "done" | "failed";
+  status: "running" | "done" | "failed" | "detached";
   output: string[];     // accumulated output lines
   startedAt: string;    // ISO timestamp
   completedAt?: string;
@@ -750,7 +750,8 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           // Detached/async processes: the tool call completes but the process keeps running
           const isBackgroundLaunch = /started in detached background|started in background|command started.*shellId/i.test(resultStr);
           if (isBackgroundLaunch) {
-            console.log(`[process] ${completedProc.id} is a background/detached process — keeping as running`);
+            console.log(`[process] ${completedProc.id} is a background/detached process — marking as detached`);
+            completedProc.status = "detached";
             completedProc.result = resultStr.slice(0, 2000);
             broadcastToAll({ type: "process_update", process: completedProc });
           } else {
