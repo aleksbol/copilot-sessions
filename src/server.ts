@@ -1582,8 +1582,9 @@ function eventsToHistory(events: SessionEvent[]): any[] {
         messages.push({
           role: "tool_call",
           name: data.name ?? data.toolName ?? "unknown",
-          args: data.args ?? data.input ?? {},
+          args: data.arguments ?? data.args ?? data.input ?? {},
           callId: event.id,
+          intention: data.intention ?? "",
           timestamp: event.timestamp,
         });
         break;
