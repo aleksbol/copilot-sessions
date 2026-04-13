@@ -983,7 +983,7 @@
     "read_file", "view",
     "edit", "edit_file", "replace_string_in_file", "multi_replace_string_in_file",
     "create", "create_file", "delete_file",
-    "ask_user", "glob", "sql", "session_store_sql",
+    "glob", "sql", "session_store_sql",
   ]);
 
   // Lookup for tool display info: { icon, label(args), resultLabel }
@@ -1060,6 +1060,35 @@
       el.id = `tool-${callId}`;
       el.textContent = intentText;
       messagesEl.appendChild(el);
+      scrollToBottom();
+      return;
+    }
+
+    // ask_user: render as a read-only prompt card showing the question and choices
+    if (normalizedName === "ask_user") {
+      const card = document.createElement("div");
+      card.className = "prompt-card prompt-answered";
+      card.id = `tool-${callId}`;
+      if (parsedArgs.question) {
+        const q = document.createElement("div");
+        q.className = "prompt-question";
+        q.innerHTML = renderMarkdown(parsedArgs.question);
+        card.appendChild(q);
+      }
+      const choices = parsedArgs.choices || [];
+      if (choices.length > 0) {
+        const choicesDiv = document.createElement("div");
+        choicesDiv.className = "prompt-choices";
+        for (const choice of choices) {
+          const btn = document.createElement("button");
+          btn.className = "prompt-choice-btn";
+          btn.textContent = choice;
+          btn.disabled = true;
+          choicesDiv.appendChild(btn);
+        }
+        card.appendChild(choicesDiv);
+      }
+      messagesEl.appendChild(card);
       scrollToBottom();
       return;
     }
