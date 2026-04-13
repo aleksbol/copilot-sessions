@@ -746,10 +746,19 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           ?? processStore.get(data.toolCallId ?? "");
         console.log(`[process] COMPLETE id=${event.id} parentId=${event.parentId} toolCallId=${data.toolCallId} found=${!!completedProc} storeKeys=[${[...processStore.keys()].join(",")}]`);
         if (completedProc) {
-          completedProc.status = "done";
-          completedProc.completedAt = new Date().toISOString();
-          completedProc.result = typeof result === "string" ? result.slice(0, 2000) : JSON.stringify(result).slice(0, 2000);
-          broadcastToAll({ type: "process_update", process: completedProc });
+          const resultStr = typeof result === "string" ? result : JSON.stringify(result);
+          // Detached/async processes: the tool call completes but the process keeps running
+          const isBackgroundLaunch = /started in detached background|started in background|command started.*shellId/i.test(resultStr);
+          if (isBackgroundLaunch) {
+            console.log(`[process] ${completedProc.id} is a background/detached process — keeping as running`);
+            completedProc.result = resultStr.slice(0, 2000);
+            broadcastToAll({ type: "process_update", process: completedProc });
+          } else {
+            completedProc.status = "done";
+            completedProc.completedAt = new Date().toISOString();
+            completedProc.result = resultStr.slice(0, 2000);
+            broadcastToAll({ type: "process_update", process: completedProc });
+          }
         }
         break;
       }
