@@ -413,6 +413,11 @@
         break;
 
       case "done":
+        // Bump this session to the top of the sidebar list
+        {
+          const doneSession = sessions.find(s => s.sessionId === msg.sessionId);
+          if (doneSession) { doneSession.updatedAt = new Date().toISOString(); renderSessionList(); }
+        }
         if (msg.sessionId === currentSessionId) {
           hideThinkingIndicator();
           finishStreaming(msg.sessionId);
@@ -528,7 +533,12 @@
 
   function renderSessionList() {
     sessionListEl.innerHTML = "";
-    for (const s of sessions) {
+    const sorted = [...sessions].sort((a, b) => {
+      const ta = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+      const tb = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+      return tb - ta;
+    });
+    for (const s of sorted) {
       const div = document.createElement("div");
       div.className = "session-item" + (s.sessionId === currentSessionId ? " active" : "");
 
@@ -544,6 +554,16 @@
       time.className = "session-time";
       time.textContent = formatRelativeTime(s.updatedAt || s.createdAt);
       titleRow.appendChild(time);
+
+      const renameBtn = document.createElement("button");
+      renameBtn.className = "session-rename";
+      renameBtn.textContent = "✎";
+      renameBtn.title = "Rename session";
+      renameBtn.onclick = (e) => {
+        e.stopPropagation();
+        startRenameSession(title, s);
+      };
+      titleRow.appendChild(renameBtn);
 
       div.appendChild(titleRow);
 
@@ -578,6 +598,34 @@
       div.onclick = () => resumeSession(s.sessionId);
       sessionListEl.appendChild(div);
     }
+  }
+
+  function startRenameSession(titleEl, session) {
+    const input = document.createElement("input");
+    input.className = "session-rename-input";
+    input.value = session.title || "";
+    input.maxLength = 100;
+    titleEl.replaceWith(input);
+    input.focus();
+    input.select();
+
+    function commit() {
+      const newName = input.value.trim();
+      if (newName && newName !== session.title) {
+        session.title = newName;
+        wsSend({ type: "rename_session", sessionId: session.sessionId, name: newName });
+        if (session.sessionId === currentSessionId) {
+          chatTitle.textContent = newName;
+        }
+      }
+      renderSessionList();
+    }
+
+    input.onblur = commit;
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") { input.blur(); }
+      if (e.key === "Escape") { input.onblur = null; renderSessionList(); }
+    };
   }
 
   function resumeSession(sessionId) {

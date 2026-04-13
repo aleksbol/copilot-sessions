@@ -54,7 +54,7 @@ const activeSessions = new Map<string, CopilotSession>();
 // cwd is stored as a fallback cache; the SDK's SessionMetadata.context.cwd is
 // the preferred source (so sessions created by the CLI are handled correctly).
 const SESSION_META_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "session-meta.json");
-const sessionMeta = new Map<string, { model: string; cwd?: string }>();
+const sessionMeta = new Map<string, { model: string; cwd?: string; name?: string }>();
 
 function loadSessionMeta() {
   try {
@@ -62,7 +62,7 @@ function loadSessionMeta() {
       const data = JSON.parse(fs.readFileSync(SESSION_META_FILE, "utf-8"));
       for (const [k, v] of Object.entries(data)) {
         const entry = v as { model?: string; cwd?: string };
-        sessionMeta.set(k, { model: entry.model ?? "", cwd: entry.cwd });
+        sessionMeta.set(k, { model: entry.model ?? "", cwd: entry.cwd, name: (entry as any).name });
       }
       console.log(`[meta] loaded ${sessionMeta.size} session(s) from disk`);
     }
@@ -645,12 +645,16 @@ wss.on("connection", (ws: any) => {
             const meta = sessionMeta.get(s.sessionId ?? s.id);
             return {
               sessionId: s.sessionId ?? s.id,
-              title: s.title ?? s.name ?? "Session",
+              title: meta?.name ?? s.title ?? s.name ?? "Session",
               cwd: s.context?.cwd ?? "",
               model: meta?.model ?? s.model ?? "",
               createdAt: s.startTime ?? s.createdAt ?? "",
               updatedAt: s.lastActiveTime ?? s.updatedAt ?? "",
             };
+          }).sort((a: any, b: any) => {
+            const ta = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+            const tb = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+            return tb - ta;
           });
           send(ws, { type: "session_list", sessions: sessionList });
           break;
@@ -690,6 +694,7 @@ wss.on("connection", (ws: any) => {
           subscribeToSession(ws, sessionId);
 
           // Fetch and send history (retry on transient "Session not found" errors)
+          // If all retries fail, do a fresh re-resume to fully activate the session and try once more.
           {
             const maxAttempts = 4;
             const retryDelayMs = 800;
@@ -707,8 +712,26 @@ wss.on("connection", (ws: any) => {
                   console.warn(`[session] getMessages attempt ${attempt} failed ("Session not found"), retrying in ${retryDelayMs}ms...`);
                   await new Promise(res => setTimeout(res, retryDelayMs));
                 } else {
-                  console.warn(`[session] could not get messages after ${attempt} attempt(s): ${e.message}`);
-                  send(ws, { type: "session_history", sessionId, messages: [] });
+                  console.warn(`[session] getMessages retries exhausted: ${e.message} — trying fresh re-resume...`);
+                  // Fresh re-resume: create a new session object to fully activate the CLI connection
+                  try {
+                    const reSession = await copilot.resumeSession(sessionId, {
+                      streaming: true,
+                      onPermissionRequest: approveAll,
+                      onUserInputRequest: createUserInputHandler(sessionId),
+                      onElicitationRequest: createElicitationHandler(sessionId),
+                    });
+                    activeSessions.set(sessionId, reSession);
+                    bindSessionEvents(reSession, sessionId);
+                    const events2 = await reSession.getMessages();
+                    const history2 = eventsToHistory(events2);
+                    send(ws, { type: "session_history", sessionId, messages: history2 });
+                    historyFetched = true;
+                    console.log(`[session] history fetched after fresh re-resume`);
+                  } catch (reErr: any) {
+                    console.warn(`[session] fresh re-resume getMessages also failed: ${reErr.message}`);
+                    send(ws, { type: "session_history", sessionId, messages: [] });
+                  }
                   break;
                 }
               }
@@ -746,14 +769,30 @@ wss.on("connection", (ws: any) => {
             const meta2 = sessionMeta.get(s.sessionId ?? s.id);
             return {
               sessionId: s.sessionId ?? s.id,
-              title: s.title ?? s.name ?? "Session",
+              title: meta2?.name ?? s.title ?? s.name ?? "Session",
               cwd: s.context?.cwd ?? "",
               model: meta2?.model ?? s.model ?? "",
               createdAt: s.startTime ?? s.createdAt ?? "",
               updatedAt: s.lastActiveTime ?? s.updatedAt ?? "",
             };
+          }).sort((a: any, b: any) => {
+            const ta = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+            const tb = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+            return tb - ta;
           });
           send(ws, { type: "session_list", sessions: sessionList2 });
+          break;
+        }
+
+        // ── Rename a session ──
+        case "rename_session": {
+          const { sessionId, name } = msg;
+          const meta = sessionMeta.get(sessionId) ?? { model: "" };
+          meta.name = name?.trim() || undefined;
+          sessionMeta.set(sessionId, meta);
+          saveSessionMeta();
+          broadcast(sessionId, { type: "title_changed", sessionId, title: meta.name ?? "Session" });
+          console.log(`[session] renamed: ${sessionId.substring(0, 8)} → "${meta.name}"`);
           break;
         }
 
