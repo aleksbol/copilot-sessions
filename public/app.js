@@ -570,19 +570,6 @@
       };
       titleRow.appendChild(renameBtn);
 
-      div.appendChild(titleRow);
-
-      // Show CWD as subtitle if available
-      if (s.cwd) {
-        const cwdEl = document.createElement("div");
-        cwdEl.className = "session-cwd";
-        // Show just the last folder name
-        const shortCwd = s.cwd.split(/[/\\]/).filter(Boolean).pop() || s.cwd;
-        cwdEl.textContent = shortCwd;
-        cwdEl.title = s.cwd;
-        div.appendChild(cwdEl);
-      }
-
       const del = document.createElement("button");
       del.className = "session-delete";
       del.textContent = "×";
@@ -598,7 +585,19 @@
           }
         }
       };
-      div.appendChild(del);
+      titleRow.appendChild(del);
+
+      div.appendChild(titleRow);
+
+      // Show CWD as subtitle if available
+      if (s.cwd) {
+        const cwdEl = document.createElement("div");
+        cwdEl.className = "session-cwd";
+        const shortCwd = s.cwd.split(/[/\\]/).filter(Boolean).pop() || s.cwd;
+        cwdEl.textContent = shortCwd;
+        cwdEl.title = s.cwd;
+        div.appendChild(cwdEl);
+      }
 
       div.onclick = () => resumeSession(s.sessionId);
       sessionListEl.appendChild(div);
