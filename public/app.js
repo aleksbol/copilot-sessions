@@ -23,6 +23,7 @@
   const trackedProcesses = new Map(); // processId → process object
   let sendMode = "normal"; // "normal" or "loop"
   let loopActive = false;
+  const loopingSessions = new Set(); // sessionIds with active loops
   let menuHideTimer = null;
 
   // ── DOM refs ──
@@ -451,6 +452,7 @@
         break;
 
       case "loop_started":
+        loopingSessions.add(msg.sessionId);
         if (msg.sessionId === currentSessionId) {
           loopActive = true;
           loopIndicator.style.display = "flex";
@@ -465,6 +467,7 @@
         break;
 
       case "loop_ended":
+        loopingSessions.delete(msg.sessionId);
         if (msg.sessionId === currentSessionId) {
           loopActive = false;
           loopIndicator.style.display = "none";
@@ -477,6 +480,8 @@
         break;
 
       case "done":
+        // Always clear streaming state for the session, even if not current
+        streamingSessionIds.delete(msg.sessionId);
         // Bump this session to the top of the sidebar list
         {
           const doneSession = sessions.find(s => s.sessionId === msg.sessionId);
@@ -696,6 +701,9 @@
     // Sync streaming state to the target session
     isStreaming = streamingSessionIds.has(sessionId);
     hideThinkingIndicator();
+    // Sync loop indicator to the target session
+    loopActive = loopingSessions.has(sessionId);
+    loopIndicator.style.display = loopActive ? "flex" : "none";
     updateSendState();
     const session = sessions.find((s) => s.sessionId === sessionId);
     chatTitle.textContent = session?.title || "Session";
