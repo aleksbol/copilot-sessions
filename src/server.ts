@@ -707,6 +707,8 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
         });
         // Track shell processes in the process store
         if (["powershell", "bash", "shell"].includes(toolName)) {
+          const toolCallId = data.toolCallId ?? (event as any).toolCallId ?? "";
+          console.log(`[process] START id=${event.id} toolCallId=${toolCallId} tool=${toolName} dataKeys=${Object.keys(data).join(",")}`);
           const proc: TrackedProcess = {
             id: event.id,
             sessionId,
@@ -718,6 +720,8 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
             startedAt: new Date().toISOString(),
           };
           processStore.set(event.id, proc);
+          // Also index by toolCallId so completion events can find it
+          if (toolCallId) processStore.set(toolCallId, proc);
           pruneProcesses();
           broadcastToAll({ type: "process_update", process: proc });
         }
@@ -736,8 +740,11 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           callId: event.id,
           parentId: event.parentId ?? undefined,
         });
-        // Update process store if tracked
-        const completedProc = processStore.get(event.id) ?? processStore.get(event.parentId ?? "");
+        // Update process store if tracked — try event.id, parentId, and data.toolCallId
+        const completedProc = processStore.get(event.id)
+          ?? processStore.get(event.parentId ?? "")
+          ?? processStore.get(data.toolCallId ?? "");
+        console.log(`[process] COMPLETE id=${event.id} parentId=${event.parentId} toolCallId=${data.toolCallId} found=${!!completedProc} storeKeys=[${[...processStore.keys()].join(",")}]`);
         if (completedProc) {
           completedProc.status = "done";
           completedProc.completedAt = new Date().toISOString();
@@ -768,10 +775,11 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           output: partialOutput,
         });
         // Append to process output if tracked
-        const partialProc = processStore.get(data.toolCallId ?? event.id);
+        const partialKey = data.toolCallId ?? event.id;
+        const partialProc = processStore.get(partialKey);
+        console.log(`[process] PARTIAL key=${partialKey} found=${!!partialProc} storeKeys=[${[...processStore.keys()].join(",")}]`);
         if (partialProc && partialOutput) {
           partialProc.output.push(typeof partialOutput === "string" ? partialOutput : JSON.stringify(partialOutput));
-          // Cap output buffer at 500 lines
           if (partialProc.output.length > 500) {
             partialProc.output = partialProc.output.slice(-400);
           }
@@ -1087,7 +1095,16 @@ wss.on("connection", (ws: any) => {
 
         // ── List tracked processes ──
         case "list_processes": {
-          const processes = [...processStore.values()].sort((a, b) => (b.startedAt > a.startedAt ? 1 : -1));
+          // Deduplicate since processes may be stored under multiple keys
+          const seen = new Set<string>();
+          const processes: TrackedProcess[] = [];
+          for (const proc of processStore.values()) {
+            if (!seen.has(proc.id)) {
+              seen.add(proc.id);
+              processes.push(proc);
+            }
+          }
+          processes.sort((a, b) => (b.startedAt > a.startedAt ? 1 : -1));
           send(ws, { type: "process_list", processes });
           break;
         }
