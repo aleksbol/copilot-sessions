@@ -983,6 +983,7 @@
     "read_file", "view",
     "edit", "edit_file", "replace_string_in_file", "multi_replace_string_in_file",
     "create", "create_file", "delete_file",
+    "ask_user", "glob", "sql", "session_store_sql",
   ]);
 
   // Lookup for tool display info: { icon, label(args), resultLabel }
@@ -1012,6 +1013,12 @@
     manage_todo_list: { icon: "📋", label: () => "Update TODO list" },
     runSubagent:    { icon: "🤖", label: a => `Delegate: ${truncate(a.description || "", 60)}` },
     create_and_run_task: { icon: "🤖", label: a => `Run task: ${truncate(a.description || a.title || "", 60)}` },
+    ask_user:       { icon: "❓", label: a => truncate(a.question || "Question", 80) },
+    sql:            { icon: "🗄️", label: a => truncate(a.description || a.query || "SQL query", 80) },
+    web_fetch:      { icon: "🌐", label: a => `Fetch ${truncate(a.url || "", 60)}` },
+    glob:           { icon: "📂", label: a => `Find files: ${truncate(a.pattern || "", 60)}` },
+    task:           { icon: "🤖", label: a => `${truncate(a.description || a.name || "Sub-agent", 60)}` },
+    session_store_sql: { icon: "🗄️", label: a => truncate(a.description || "Session store query", 80) },
   };
 
   function shortPath(p) {
