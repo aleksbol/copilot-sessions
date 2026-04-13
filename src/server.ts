@@ -5,13 +5,94 @@ import { WebSocketServer, WebSocket } from "ws";
 import http from "node:http";
 import path from "node:path";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { ConfidentialClientApplication } from "@azure/msal-node";
+import dotenv from "dotenv";
+import { parse as parseCookie, serialize as serializeCookie } from "cookie";
+
+// Load .env from project root
+dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".env") });
 
 // ── Config ──
 
 const PORT = parseInt(process.env.PORT || "3847", 10);
 const DEFAULT_CWD = process.env.COPILOT_CWD || process.cwd();
+
+// ── Auth config ──
+
+const AUTH_TENANT_ID = process.env.AUTH_TENANT_ID || "";
+const AUTH_CLIENT_ID = process.env.AUTH_CLIENT_ID || "";
+const AUTH_ALLOWED_USER = process.env.AUTH_ALLOWED_USER?.toLowerCase() || "";
+
+if (!AUTH_TENANT_ID || !AUTH_CLIENT_ID || !AUTH_ALLOWED_USER) {
+  console.error(`
+❌  Missing required auth environment variables.
+    Set AUTH_TENANT_ID, AUTH_CLIENT_ID, and AUTH_ALLOWED_USER
+    in your environment or in a .env file.
+`);
+  process.exit(1);
+}
+
+// Secret for signing session tokens — random per server start
+const SESSION_SECRET = crypto.randomBytes(32);
+// In-memory session store: token → { email, expiresAt }
+const authSessions = new Map<string, { email: string; expiresAt: number }>();
+
+const msalConfig = {
+  auth: {
+    clientId: AUTH_CLIENT_ID,
+    authority: `https://login.microsoftonline.com/${AUTH_TENANT_ID}`,
+  },
+};
+const msalClient = new ConfidentialClientApplication({
+  ...msalConfig,
+  auth: { ...msalConfig.auth, clientSecret: "unused" },
+});
+
+// PKCE helpers
+function base64url(buf: Buffer): string {
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function generatePkce() {
+  const verifier = base64url(crypto.randomBytes(32));
+  const challenge = base64url(crypto.createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
+// Temporary store for PKCE verifiers keyed by state
+const pkceStore = new Map<string, { verifier: string; createdAt: number }>();
+
+function createSessionToken(email: string): string {
+  const token = base64url(crypto.randomBytes(32));
+  const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24h
+  authSessions.set(token, { email, expiresAt });
+  return token;
+}
+
+function validateSessionToken(token: string): string | null {
+  const session = authSessions.get(token);
+  if (!session) return null;
+  if (Date.now() > session.expiresAt) {
+    authSessions.delete(token);
+    return null;
+  }
+  return session.email;
+}
+
+function getSessionTokenFromReq(req: http.IncomingMessage): string | null {
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) return null;
+  const cookies = parseCookie(cookieHeader);
+  return cookies["session_token"] || null;
+}
+
+function isAuthenticated(req: http.IncomingMessage): boolean {
+  const token = getSessionTokenFromReq(req);
+  if (!token) return false;
+  return validateSessionToken(token) !== null;
+}
 
 // ── Copilot SDK client ──
 
@@ -118,6 +199,124 @@ let requestIdCounter = 0;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
+// ── Auth routes (before any middleware) ──
+
+app.get("/auth/login", (_req, res) => {
+  const state = base64url(crypto.randomBytes(16));
+  const { verifier, challenge } = generatePkce();
+  pkceStore.set(state, { verifier, createdAt: Date.now() });
+
+  // Determine redirect URI from request
+  const proto = _req.headers["x-forwarded-proto"] || _req.protocol || "http";
+  const host = _req.headers["x-forwarded-host"] || _req.headers.host || `127.0.0.1:${PORT}`;
+  const redirectUri = `${proto}://${host}/auth/callback`;
+
+  const authUrl = `https://login.microsoftonline.com/${AUTH_TENANT_ID}/oauth2/v2.0/authorize?`
+    + `client_id=${AUTH_CLIENT_ID}`
+    + `&response_type=code`
+    + `&redirect_uri=${encodeURIComponent(redirectUri)}`
+    + `&scope=${encodeURIComponent("openid profile email")}`
+    + `&state=${state}`
+    + `&code_challenge=${challenge}`
+    + `&code_challenge_method=S256`
+    + `&response_mode=query`;
+
+  res.redirect(authUrl);
+});
+
+app.get("/auth/callback", async (req, res) => {
+  const { code, state, error, error_description } = req.query as Record<string, string>;
+
+  if (error) {
+    res.status(403).send(`Authentication error: ${error_description || error}`);
+    return;
+  }
+
+  if (!code || !state) {
+    res.status(400).send("Missing code or state parameter");
+    return;
+  }
+
+  const pkce = pkceStore.get(state);
+  if (!pkce) {
+    res.status(400).send("Invalid or expired state");
+    return;
+  }
+  pkceStore.delete(state);
+
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  const host = req.headers["x-forwarded-host"] || req.headers.host || `127.0.0.1:${PORT}`;
+  const redirectUri = `${proto}://${host}/auth/callback`;
+
+  try {
+    const result = await msalClient.acquireTokenByCode({
+      code,
+      redirectUri,
+      scopes: ["openid", "profile", "email"],
+      codeVerifier: pkce.verifier,
+    });
+
+    const claims = result?.idTokenClaims as any;
+    const email = (claims?.preferred_username || claims?.email || claims?.upn || "").toLowerCase();
+
+    if (!email) {
+      res.status(403).send("Could not determine user email from token");
+      return;
+    }
+
+    if (email !== AUTH_ALLOWED_USER) {
+      console.warn(`[auth] denied login for: ${email} (allowed: ${AUTH_ALLOWED_USER})`);
+      res.status(403).send(`Access denied. User ${email} is not authorized.`);
+      return;
+    }
+
+    const token = createSessionToken(email);
+    console.log(`[auth] user authenticated: ${email}`);
+
+    res.setHeader("Set-Cookie", serializeCookie("session_token", token, {
+      httpOnly: true,
+      secure: proto === "https",
+      sameSite: "lax",
+      path: "/",
+      maxAge: 24 * 60 * 60,
+    }));
+    res.redirect("/");
+  } catch (e: any) {
+    console.error("[auth] token exchange failed:", e.message);
+    res.status(500).send("Authentication failed: " + e.message);
+  }
+});
+
+app.get("/auth/logout", (_req, res) => {
+  const token = getSessionTokenFromReq(_req);
+  if (token) authSessions.delete(token);
+  res.setHeader("Set-Cookie", serializeCookie("session_token", "", {
+    httpOnly: true,
+    path: "/",
+    maxAge: 0,
+  }));
+  res.redirect("/auth/login");
+});
+
+// ── Auth middleware — gate everything except /auth/* ──
+
+app.use((req, res, next) => {
+  if (req.path.startsWith("/auth/")) return next();
+  // Allow login page assets
+  if (req.path === "/login.html") return next();
+  if (!isAuthenticated(req)) {
+    // API calls get 401, page requests get redirected
+    if (req.path.startsWith("/api/") || req.headers.accept?.includes("application/json")) {
+      res.status(401).json({ error: "Not authenticated" });
+    } else {
+      res.redirect("/login.html");
+    }
+    return;
+  }
+  next();
+});
+
 app.use(express.static(path.join(__dirname, "..", "public")));
 
 // API endpoint: list available models
@@ -132,9 +331,28 @@ app.get("/api/models", async (_req, res) => {
 
 const server = http.createServer(app);
 
-// ── WebSocket server ──
+// ── WebSocket server (with auth gate on upgrade) ──
 
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  // Only handle /ws path
+  const url = new URL(req.url || "/", `http://${req.headers.host}`);
+  if (url.pathname !== "/ws") {
+    socket.destroy();
+    return;
+  }
+  if (!isAuthenticated(req)) {
+    console.warn("[ws] rejected unauthenticated WebSocket upgrade");
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
+});
+
 let msgSeq = 0; // monotonic message ID for deduplication
 
 function send(ws: WebSocket, data: Record<string, unknown>) {
@@ -1000,6 +1218,8 @@ server.listen(PORT, "127.0.0.1", () => {
    WebSocket:  ws://127.0.0.1:${PORT}/ws
    Default CWD:   ${DEFAULT_CWD}
    Default model: ${defaultModel || '(auto-detect on first use)'}
+   Auth:       Entra ID (tenant: ${AUTH_TENANT_ID.substring(0, 8)}…)
+   Allowed:    ${AUTH_ALLOWED_USER}
 
    For phone access, run in another terminal:
      devtunnel host

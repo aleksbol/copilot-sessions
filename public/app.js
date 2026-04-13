@@ -116,11 +116,16 @@
       }
     };
 
-    newWs.onclose = () => {
+    newWs.onclose = (event) => {
       if (ws !== newWs) return; // already replaced
-      console.log("[ws] disconnected");
+      console.log("[ws] disconnected, code:", event.code);
       stopHeartbeat();
       updateConnectionStatus(false);
+      // If server rejected with 401, redirect to login
+      if (event.code === 1006 && reconnectAttempts >= 2) {
+        window.location.href = "/login.html";
+        return;
+      }
       scheduleReconnect();
     };
 

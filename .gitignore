@@ -3,3 +3,4 @@ dist/
 .copilot-sessions/
 *.log
 session-meta.json
+.env
