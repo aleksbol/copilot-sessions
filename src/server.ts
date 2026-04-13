@@ -189,9 +189,9 @@ const LOOP_MAX_DELAY = 3_600_000;   // 1 hour
 
 const activeLoops = new Map<string, LoopState>(); // sessionId → LoopState
 
-const LOOP_INSTRUCTION = `\n\n[LOOP MODE IS ON] You must keep working on this task until it is fully complete. When you are done or fully blocked, you MUST include the following JSON block at the very end of your response:\n{"loop_status": "done"}\nor\n{"loop_status": "blocked", "reason": "description of what is blocking you"}\nDo NOT include this JSON block until you are truly finished or blocked. If you still have work to do, just continue working without the JSON block.`;
+const LOOP_INSTRUCTION = `\n\n---\n\n[LOOP MODE IS ON] You must keep working on this task until it is fully complete. When you are done or fully blocked, you MUST include the following JSON block at the very end of your response:\n{"loop_status": "done"}\nor\n{"loop_status": "blocked", "reason": "description of what is blocking you"}\nDo NOT include this JSON block until you are truly finished or blocked. If you still have work to do, just continue working without the JSON block.`;
 
-const LOOP_CONTINUATION = `[LOOP MODE] Continue working on the original task. You have more work to do. When finished or blocked, include at the very end of your response:\n{"loop_status": "done"}\nor\n{"loop_status": "blocked", "reason": "description of what is blocking you"}`;
+const LOOP_CONTINUATION = `---\n\n[LOOP MODE] Continue working on the original task. You have more work to do. When finished or blocked, include at the very end of your response:\n{"loop_status": "done"}\nor\n{"loop_status": "blocked", "reason": "description of what is blocking you"}`;
 
 function parseLoopStatus(content: string): { status: string; reason?: string } | null {
   // Look for {"loop_status": "done"} or {"loop_status": "blocked", "reason": "..."} at the end
