@@ -89,12 +89,37 @@
             <rect x="3" y="3" width="10" height="10" rx="2"/>
           </svg>
         </button>
-        <button id="send-btn" class="send-btn" disabled title="Send">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M22 2L11 13"></path>
-            <path d="M22 2L15 22L11 13L2 9L22 2Z"></path>
-          </svg>
-        </button>
+        <div class="send-btn-wrapper">
+          <button id="send-btn" class="send-btn" disabled title="Send">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 2L11 13"></path>
+              <path d="M22 2L15 22L11 13L2 9L22 2Z"></path>
+            </svg>
+          </button>
+          <div id="send-mode-menu" class="send-mode-menu" style="display:none">
+            <button class="send-mode-option" data-mode="normal">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 2L11 13"></path>
+                <path d="M22 2L15 22L11 13L2 9L22 2Z"></path>
+              </svg>
+              Send
+            </button>
+            <button class="send-mode-option" data-mode="loop">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M17 1l4 4-4 4"></path>
+                <path d="M3 11V9a4 4 0 0 1 4-4h14"></path>
+                <path d="M7 23l-4-4 4-4"></path>
+                <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>
+              </svg>
+              Loop
+            </button>
+          </div>
+        </div>
+      </div>
+      <div id="loop-indicator" class="loop-indicator" style="display:none">
+        <span class="loop-indicator-icon">🔄</span>
+        <span id="loop-indicator-text">Loop mode — iteration 1</span>
+        <button id="loop-stop-btn" class="loop-stop-btn" title="Stop loop">✕</button>
       </div>
       <div id="context-bar" class="context-bar" style="display:none">
         <div class="context-bar-track">

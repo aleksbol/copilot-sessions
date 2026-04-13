@@ -1060,6 +1060,109 @@ body {
   background: var(--accent-hover);
 }
 
+.send-btn.loop-mode {
+  background: #8b5cf6;
+}
+
+.send-btn.loop-mode:not(:disabled):hover {
+  background: #7c3aed;
+}
+
+/* Send mode picker */
+
+.send-btn-wrapper {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.send-mode-menu {
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  margin-bottom: 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  z-index: 50;
+  min-width: 120px;
+  animation: fadeInUp 0.12s ease-out;
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.send-mode-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: none;
+  color: var(--text-primary);
+  font-size: 13px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.send-mode-option:hover {
+  background: var(--bg-hover);
+}
+
+.send-mode-option svg {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+}
+
+.send-mode-option[data-mode="loop"] svg {
+  color: #8b5cf6;
+}
+
+/* Loop indicator */
+
+.loop-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: rgba(139, 92, 246, 0.15);
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  border-radius: 6px;
+  font-size: 12px;
+  color: #a78bfa;
+  margin-top: 6px;
+}
+
+.loop-indicator-icon {
+  animation: spin 2s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.loop-stop-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+  margin-left: auto;
+  border-radius: 4px;
+}
+
+.loop-stop-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
 /* ── Button Utilities ── */
 
 .btn-icon {

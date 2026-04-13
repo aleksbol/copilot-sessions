@@ -175,6 +175,33 @@ function broadcastToAll(data: Record<string, unknown>) {
   });
 }
 
+// ── Loop mode state ──
+
+interface LoopState {
+  active: boolean;
+  iteration: number;
+  throttleDelay: number;  // current delay in ms
+  sessionId: string;
+}
+
+const LOOP_INITIAL_DELAY = 5_000;   // 5 seconds
+const LOOP_MAX_DELAY = 3_600_000;   // 1 hour
+
+const activeLoops = new Map<string, LoopState>(); // sessionId → LoopState
+
+const LOOP_INSTRUCTION = `\n\n[LOOP MODE IS ON] You must keep working on this task until it is fully complete. When you are done or fully blocked, you MUST include the following JSON block at the very end of your response:\n{"loop_status": "done"}\nor\n{"loop_status": "blocked", "reason": "description of what is blocking you"}\nDo NOT include this JSON block until you are truly finished or blocked. If you still have work to do, just continue working without the JSON block.`;
+
+const LOOP_CONTINUATION = `[LOOP MODE] Continue working on the original task. You have more work to do. When finished or blocked, include at the very end of your response:\n{"loop_status": "done"}\nor\n{"loop_status": "blocked", "reason": "description of what is blocking you"}`;
+
+function parseLoopStatus(content: string): { status: string; reason?: string } | null {
+  // Look for {"loop_status": "done"} or {"loop_status": "blocked", "reason": "..."} at the end
+  const match = content.match(/\{\s*"loop_status"\s*:\s*"(done|blocked)"(?:\s*,\s*"reason"\s*:\s*"([^"]*)")?\s*\}\s*$/);
+  if (match) {
+    return { status: match[1], reason: match[2] };
+  }
+  return null;
+}
+
 // Per-session metadata (model) — persisted to disk so it survives restarts.
 // cwd is stored as a fallback cache; the SDK's SessionMetadata.context.cwd is
 // the preferred source (so sessions created by the CLI are handled correctly).
@@ -990,7 +1017,27 @@ wss.on("connection", (ws: any) => {
             break;
           }
 
-          console.log(`[message] → ${msg.sessionId.substring(0, 8)}: ${msg.content.substring(0, 80)}...`);
+          const isLoopMode = !!msg.loopMode;
+          let prompt = msg.content;
+
+          if (isLoopMode) {
+            prompt = msg.content + LOOP_INSTRUCTION;
+            const loopState: LoopState = {
+              active: true,
+              iteration: 1,
+              throttleDelay: LOOP_INITIAL_DELAY,
+              sessionId: msg.sessionId,
+            };
+            activeLoops.set(msg.sessionId, loopState);
+            broadcast(msg.sessionId, {
+              type: "loop_started",
+              sessionId: msg.sessionId,
+              iteration: 1,
+            });
+            console.log(`[loop] started for session ${msg.sessionId.substring(0, 8)}`);
+          }
+
+          console.log(`[message] → ${msg.sessionId.substring(0, 8)}: ${msg.content.substring(0, 80)}...${isLoopMode ? " [LOOP]" : ""}`);
 
           // Broadcast the user message to all OTHER clients watching this session
           broadcast(msg.sessionId, {
@@ -1004,7 +1051,7 @@ wss.on("connection", (ws: any) => {
           // in current SDK versions — so we rely on the return value for the response.
           try {
             const result = await session.sendAndWait(
-              { prompt: msg.content },
+              { prompt },
               600_000, // 10 minute timeout
             );
 
@@ -1028,9 +1075,105 @@ wss.on("connection", (ws: any) => {
               }
               broadcast(msg.sessionId, { type: "done", sessionId: msg.sessionId });
             }
+
+            // ── Loop mode continuation ──
+            const loopState = activeLoops.get(msg.sessionId);
+            if (loopState?.active) {
+              let lastContent = content || "";
+
+              // Loop until agent signals done/blocked, or loop is aborted
+              while (loopState.active && activeLoops.has(msg.sessionId)) {
+                const loopStatus = parseLoopStatus(lastContent);
+                if (loopStatus) {
+                  console.log(`[loop] ended: status=${loopStatus.status} reason=${loopStatus.reason ?? "none"} iterations=${loopState.iteration}`);
+                  activeLoops.delete(msg.sessionId);
+                  broadcast(msg.sessionId, {
+                    type: "loop_ended",
+                    sessionId: msg.sessionId,
+                    status: loopStatus.status,
+                    reason: loopStatus.reason ?? "",
+                    iterations: loopState.iteration,
+                  });
+                  break;
+                }
+
+                // No status — continue after throttle delay
+                loopState.iteration++;
+                console.log(`[loop] iteration ${loopState.iteration}, delay=${loopState.throttleDelay}ms`);
+
+                broadcast(msg.sessionId, {
+                  type: "loop_iteration",
+                  sessionId: msg.sessionId,
+                  iteration: loopState.iteration,
+                  delay: loopState.throttleDelay,
+                });
+
+                const delayMs = loopState.throttleDelay;
+                loopState.throttleDelay = Math.min(loopState.throttleDelay * 2, LOOP_MAX_DELAY);
+
+                await new Promise(res => setTimeout(res, delayMs));
+
+                if (!loopState.active || !activeLoops.has(msg.sessionId)) {
+                  console.log(`[loop] aborted during delay`);
+                  break;
+                }
+
+                // Send continuation prompt
+                broadcast(msg.sessionId, {
+                  type: "user_message",
+                  sessionId: msg.sessionId,
+                  content: "[Loop continuation]",
+                });
+
+                try {
+                  const contResult = await session.sendAndWait(
+                    { prompt: LOOP_CONTINUATION },
+                    600_000,
+                  );
+                  const contData = contResult?.data as any;
+                  lastContent = contData?.content ?? "";
+
+                  const contEvH = turnDeliveredByEvents.get(msg.sessionId) ?? false;
+                  turnDeliveredByEvents.set(msg.sessionId, false);
+
+                  if (!contEvH && lastContent) {
+                    broadcast(msg.sessionId, {
+                      type: "assistant_message",
+                      sessionId: msg.sessionId,
+                      content: lastContent,
+                    });
+                    broadcast(msg.sessionId, { type: "done", sessionId: msg.sessionId });
+                  }
+                } catch (loopErr: any) {
+                  console.error(`[loop] continuation error:`, loopErr.message);
+                  activeLoops.delete(msg.sessionId);
+                  broadcast(msg.sessionId, {
+                    type: "loop_ended",
+                    sessionId: msg.sessionId,
+                    status: "error",
+                    reason: loopErr.message,
+                    iterations: loopState.iteration,
+                  });
+                  break;
+                }
+              }
+            }
           } catch (sendErr: any) {
             console.error(`[message] sendAndWait error:`, sendErr);
             const errMsg = sendErr?.message ?? String(sendErr);
+
+            // If loop was active, end it on error
+            if (activeLoops.has(msg.sessionId)) {
+              const ls = activeLoops.get(msg.sessionId)!;
+              activeLoops.delete(msg.sessionId);
+              broadcast(msg.sessionId, {
+                type: "loop_ended",
+                sessionId: msg.sessionId,
+                status: "error",
+                reason: errMsg,
+                iterations: ls.iteration,
+              });
+            }
 
             // If CLI lost the session, clear stale state and auto-retry resume + send
             if (errMsg.includes("Session not found") || errMsg.includes("session not found")) {
@@ -1283,6 +1426,20 @@ wss.on("connection", (ws: any) => {
         // -- Abort current turn --
         case "abort": {
           const session = activeSessions.get(msg.sessionId);
+          // Stop any active loop first
+          const loopToAbort = activeLoops.get(msg.sessionId);
+          if (loopToAbort) {
+            console.log(`[loop] aborted by user after ${loopToAbort.iteration} iterations`);
+            loopToAbort.active = false;
+            activeLoops.delete(msg.sessionId);
+            broadcast(msg.sessionId, {
+              type: "loop_ended",
+              sessionId: msg.sessionId,
+              status: "aborted",
+              reason: "Stopped by user",
+              iterations: loopToAbort.iteration,
+            });
+          }
           if (session) {
             try {
               await session.abort();

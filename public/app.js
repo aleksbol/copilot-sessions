@@ -21,6 +21,9 @@
   const seenMessageIds = new Set();
   const reasoningBlocks = new Map(); // reasoningId → { block, contentEl, streaming }
   const trackedProcesses = new Map(); // processId → process object
+  let sendMode = "normal"; // "normal" or "loop"
+  let loopActive = false;
+  let menuHideTimer = null;
 
   // ── DOM refs ──
 
@@ -57,6 +60,11 @@
   const processesCloseBtn = document.getElementById("processes-close-btn");
   const processesListEl = document.getElementById("processes-list");
   const processesBadge = document.getElementById("processes-badge");
+  const sendModeMenu = document.getElementById("send-mode-menu");
+  const sendBtnWrapper = document.querySelector(".send-btn-wrapper");
+  const loopIndicator = document.getElementById("loop-indicator");
+  const loopIndicatorText = document.getElementById("loop-indicator-text");
+  const loopStopBtn = document.getElementById("loop-stop-btn");
 
   // ── Markdown setup ──
 
@@ -440,6 +448,32 @@
         }
         updateProcessBadge();
         renderProcessList();
+        break;
+
+      case "loop_started":
+        if (msg.sessionId === currentSessionId) {
+          loopActive = true;
+          loopIndicator.style.display = "flex";
+          loopIndicatorText.textContent = "Loop mode — iteration 1";
+        }
+        break;
+
+      case "loop_iteration":
+        if (msg.sessionId === currentSessionId) {
+          loopIndicatorText.textContent = `Loop mode — iteration ${msg.iteration}` + (msg.delay > 5000 ? ` (waiting ${Math.round(msg.delay / 1000)}s)` : "");
+        }
+        break;
+
+      case "loop_ended":
+        if (msg.sessionId === currentSessionId) {
+          loopActive = false;
+          loopIndicator.style.display = "none";
+          const statusMsg = msg.status === "done" ? "completed" :
+            msg.status === "blocked" ? `blocked: ${msg.reason}` :
+            msg.status === "aborted" ? "stopped by user" :
+            `error: ${msg.reason}`;
+          appendSessionInfo("loop", `Loop ${statusMsg} after ${msg.iterations} iteration(s)`);
+        }
         break;
 
       case "done":
@@ -1291,10 +1325,14 @@
       return;
     }
 
-    console.log("[ui] sending:", content.substring(0, 80));
+    const isLoop = sendMode === "loop";
+    console.log("[ui] sending:", content.substring(0, 80), isLoop ? "[LOOP]" : "");
     appendUserMessage(content);
-    wsSend({ type: "message", sessionId: currentSessionId, content });
+    wsSend({ type: "message", sessionId: currentSessionId, content, loopMode: isLoop });
     messageInput.value = "";
+    sendMode = "normal"; // reset per-message
+    sendBtn.classList.remove("loop-mode");
+    sendBtn.title = "Send";
     autoResizeTextarea();
     updateSendState();
   }
@@ -1352,6 +1390,87 @@
   });
 
   sendBtn.addEventListener("click", handleSend);
+
+  // Send mode menu — hover (desktop) and long-press (mobile)
+  let longPressTimer = null;
+
+  function showSendMenu() {
+    if (sendBtn.disabled) return;
+    sendModeMenu.style.display = "block";
+  }
+
+  function hideSendMenu() {
+    sendModeMenu.style.display = "none";
+  }
+
+  // Desktop: show on right-click or hover with delay
+  sendBtnWrapper.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    showSendMenu();
+  });
+
+  sendBtnWrapper.addEventListener("mouseenter", () => {
+    if (menuHideTimer) { clearTimeout(menuHideTimer); menuHideTimer = null; }
+  });
+
+  sendBtnWrapper.addEventListener("mouseleave", () => {
+    menuHideTimer = setTimeout(hideSendMenu, 300);
+  });
+
+  sendModeMenu.addEventListener("mouseenter", () => {
+    if (menuHideTimer) { clearTimeout(menuHideTimer); menuHideTimer = null; }
+  });
+
+  sendModeMenu.addEventListener("mouseleave", () => {
+    menuHideTimer = setTimeout(hideSendMenu, 300);
+  });
+
+  // Mobile: long press on send button
+  sendBtn.addEventListener("touchstart", (e) => {
+    longPressTimer = setTimeout(() => {
+      e.preventDefault();
+      showSendMenu();
+    }, 500);
+  }, { passive: false });
+
+  sendBtn.addEventListener("touchend", () => {
+    if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+  });
+
+  sendBtn.addEventListener("touchmove", () => {
+    if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+  });
+
+  // Menu option clicks
+  sendModeMenu.addEventListener("click", (e) => {
+    const option = e.target.closest(".send-mode-option");
+    if (!option) return;
+    const mode = option.dataset.mode;
+    if (mode === "loop") {
+      sendMode = "loop";
+      sendBtn.classList.add("loop-mode");
+      sendBtn.title = "Send (Loop mode)";
+    } else {
+      sendMode = "normal";
+      sendBtn.classList.remove("loop-mode");
+      sendBtn.title = "Send";
+    }
+    hideSendMenu();
+  });
+
+  // Close menu on click outside
+  document.addEventListener("click", (e) => {
+    if (!sendBtnWrapper.contains(e.target) && !sendModeMenu.contains(e.target)) {
+      hideSendMenu();
+    }
+  });
+
+  // Loop stop button
+  loopStopBtn.addEventListener("click", () => {
+    if (currentSessionId) {
+      wsSend({ type: "abort", sessionId: currentSessionId });
+    }
+  });
 
   stopBtn.addEventListener("click", () => {
     if (currentSessionId) {
