@@ -52,8 +52,9 @@ The server uses Microsoft Entra ID (Azure AD) to authenticate users. Only a sing
 2. Click **New registration**
 3. Name: `Copilot Sessions` (or anything you like)
 4. Supported account types: **Single tenant** (or multi-tenant if using across personal/work)
-5. Redirect URI: **Web** → `http://localhost:3847/auth/callback`
+5. Redirect URI: **Single-page application (SPA)** → `http://localhost:3847/auth/callback`
    - For devtunnel access, also add your tunnel URL: `https://<tunnel-id>.devtunnels.ms/auth/callback`
+   - **Important**: The redirect URI must be under the **SPA** platform, not **Web** (which requires a client secret)
 6. Click **Register**
 7. Copy the **Application (client) ID** and **Directory (tenant) ID**
 

@@ -8,9 +8,9 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { ConfidentialClientApplication } from "@azure/msal-node";
 import dotenv from "dotenv";
 import { parse as parseCookie, serialize as serializeCookie } from "cookie";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 // Load .env from project root
 dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".env") });
@@ -35,34 +35,38 @@ if (!AUTH_TENANT_ID || !AUTH_CLIENT_ID || !AUTH_ALLOWED_USER) {
   process.exit(1);
 }
 
-// Secret for signing session tokens — random per server start
-const SESSION_SECRET = crypto.randomBytes(32);
 // In-memory session store: token → { email, expiresAt }
 const authSessions = new Map<string, { email: string; expiresAt: number }>();
 
-const msalConfig = {
-  auth: {
-    clientId: AUTH_CLIENT_ID,
-    authority: `https://login.microsoftonline.com/${AUTH_TENANT_ID}`,
-  },
-};
-const msalClient = new ConfidentialClientApplication({
-  ...msalConfig,
-  auth: { ...msalConfig.auth, clientSecret: "unused" },
-});
+// OIDC nonce store: nonce → expiresAt (short-lived, prevents token replay)
+const pendingNonces = new Map<string, number>();
 
-// PKCE helpers
+// Azure AD JWKS endpoint for JWT signature verification
+const JWKS = createRemoteJWKSet(
+  new URL(`https://login.microsoftonline.com/${AUTH_TENANT_ID}/discovery/v2.0/keys`)
+);
+const AUTH_ISSUER = `https://login.microsoftonline.com/${AUTH_TENANT_ID}/v2.0`;
+
+// Simple rate limiter for auth endpoints
+const authRateLimiter = (() => {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  const MAX_REQUESTS = 10;
+  const WINDOW_MS = 60_000; // 1 minute
+  return (ip: string): boolean => {
+    const now = Date.now();
+    const entry = hits.get(ip);
+    if (!entry || now > entry.resetAt) {
+      hits.set(ip, { count: 1, resetAt: now + WINDOW_MS });
+      return true;
+    }
+    entry.count++;
+    return entry.count <= MAX_REQUESTS;
+  };
+})();
+
 function base64url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
-function generatePkce() {
-  const verifier = base64url(crypto.randomBytes(32));
-  const challenge = base64url(crypto.createHash("sha256").update(verifier).digest());
-  return { verifier, challenge };
-}
-
-// Temporary store for PKCE verifiers keyed by state
-const pkceStore = new Map<string, { verifier: string; createdAt: number }>();
 
 function createSessionToken(email: string): string {
   const token = base64url(crypto.randomBytes(32));
@@ -202,68 +206,191 @@ const app = express();
 
 // ── Auth routes (before any middleware) ──
 
-app.get("/auth/login", (_req, res) => {
-  const state = base64url(crypto.randomBytes(16));
-  const { verifier, challenge } = generatePkce();
-  pkceStore.set(state, { verifier, createdAt: Date.now() });
+// Rate-limit middleware for auth routes
+app.use("/auth", (req, res, next) => {
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  if (!authRateLimiter(ip)) {
+    res.status(429).send("Too many requests. Try again later.");
+    return;
+  }
+  next();
+});
 
-  // Determine redirect URI from request
+// /auth/login — serves an HTML page that generates PKCE in the browser,
+// stores the verifier in sessionStorage, and redirects to Azure AD.
+// Also generates a server-side nonce to prevent token replay.
+app.get("/auth/login", (_req, res) => {
   const proto = _req.headers["x-forwarded-proto"] || _req.protocol || "http";
   const host = _req.headers["x-forwarded-host"] || _req.headers.host || `127.0.0.1:${PORT}`;
   const redirectUri = `${proto}://${host}/auth/callback`;
 
-  const authUrl = `https://login.microsoftonline.com/${AUTH_TENANT_ID}/oauth2/v2.0/authorize?`
-    + `client_id=${AUTH_CLIENT_ID}`
-    + `&response_type=code`
-    + `&redirect_uri=${encodeURIComponent(redirectUri)}`
-    + `&scope=${encodeURIComponent("openid profile email")}`
-    + `&state=${state}`
-    + `&code_challenge=${challenge}`
-    + `&code_challenge_method=S256`
-    + `&response_mode=query`;
+  // Generate server-side nonce and store it (valid for 10 minutes)
+  const nonce = base64url(crypto.randomBytes(32));
+  pendingNonces.set(nonce, Date.now() + 10 * 60 * 1000);
+  // Prune expired nonces
+  for (const [n, exp] of pendingNonces) {
+    if (Date.now() > exp) pendingNonces.delete(n);
+  }
 
-  res.redirect(authUrl);
+  res.type("html").send(`<!DOCTYPE html>
+<html><head><title>Signing in…</title></head><body>
+<p>Redirecting to Microsoft login…</p>
+<script>
+(async () => {
+  // Generate PKCE verifier + challenge in the browser
+  const buf = new Uint8Array(32);
+  crypto.getRandomValues(buf);
+  const verifier = btoa(String.fromCharCode(...buf))
+    .replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+
+  const digest = await crypto.subtle.digest("SHA-256",
+    new TextEncoder().encode(verifier));
+  const challenge = btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+
+  // Random state
+  const stateBuf = new Uint8Array(16);
+  crypto.getRandomValues(stateBuf);
+  const state = btoa(String.fromCharCode(...stateBuf))
+    .replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+
+  // Store verifier and nonce so /auth/callback page can use them
+  sessionStorage.setItem("pkce_verifier", verifier);
+  sessionStorage.setItem("pkce_state", state);
+  sessionStorage.setItem("oidc_nonce", ${JSON.stringify(nonce)});
+
+  const params = new URLSearchParams({
+    client_id: ${JSON.stringify(AUTH_CLIENT_ID)},
+    response_type: "code",
+    redirect_uri: ${JSON.stringify(redirectUri)},
+    scope: "openid profile email",
+    state,
+    nonce: ${JSON.stringify(nonce)},
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    response_mode: "query",
+  });
+
+  location.href = "https://login.microsoftonline.com/${AUTH_TENANT_ID}/oauth2/v2.0/authorize?" + params;
+})();
+</script>
+</body></html>`);
 });
 
-app.get("/auth/callback", async (req, res) => {
-  const { code, state, error, error_description } = req.query as Record<string, string>;
-
-  if (error) {
-    res.status(403).send(`Authentication error: ${error_description || error}`);
-    return;
-  }
-
-  if (!code || !state) {
-    res.status(400).send("Missing code or state parameter");
-    return;
-  }
-
-  const pkce = pkceStore.get(state);
-  if (!pkce) {
-    res.status(400).send("Invalid or expired state");
-    return;
-  }
-  pkceStore.delete(state);
-
-  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
-  const host = req.headers["x-forwarded-host"] || req.headers.host || `127.0.0.1:${PORT}`;
+// /auth/callback — serves an HTML page that exchanges the code for tokens
+// via browser-side fetch (cross-origin, required by Azure AD SPA platform).
+app.get("/auth/callback", (_req, res) => {
+  const proto = _req.headers["x-forwarded-proto"] || _req.protocol || "http";
+  const host = _req.headers["x-forwarded-host"] || _req.headers.host || `127.0.0.1:${PORT}`;
   const redirectUri = `${proto}://${host}/auth/callback`;
 
+  res.type("html").send(`<!DOCTYPE html>
+<html><head><title>Completing sign-in…</title></head><body>
+<p id="status">Completing sign-in…</p>
+<script>
+(async () => {
+  const status = document.getElementById("status");
   try {
-    const result = await msalClient.acquireTokenByCode({
-      code,
-      redirectUri,
-      scopes: ["openid", "profile", "email"],
-      codeVerifier: pkce.verifier,
+    const params = new URLSearchParams(location.search);
+    const code = params.get("code");
+    const state = params.get("state");
+    const error = params.get("error");
+    const errorDesc = params.get("error_description");
+
+    if (error) { status.textContent = "Auth error: " + (errorDesc || error); return; }
+    if (!code || !state) { status.textContent = "Missing code or state"; return; }
+
+    const savedState = sessionStorage.getItem("pkce_state");
+    if (state !== savedState) { status.textContent = "State mismatch"; return; }
+
+    const verifier = sessionStorage.getItem("pkce_verifier");
+    if (!verifier) { status.textContent = "Missing PKCE verifier"; return; }
+
+    // Exchange code for tokens — browser-side fetch (cross-origin to Azure AD)
+    const tokenRes = await fetch(
+      "https://login.microsoftonline.com/${AUTH_TENANT_ID}/oauth2/v2.0/token",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: ${JSON.stringify(AUTH_CLIENT_ID)},
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: ${JSON.stringify(redirectUri)},
+          code_verifier: verifier,
+          scope: "openid profile email",
+        }),
+      }
+    );
+    const tokenJson = await tokenRes.json();
+    if (tokenJson.error) throw new Error(tokenJson.error_description || tokenJson.error);
+
+    const idToken = tokenJson.id_token;
+    if (!idToken) throw new Error("No id_token in response");
+
+    // Retrieve the nonce to send to server for validation
+    const nonce = sessionStorage.getItem("oidc_nonce");
+    if (!nonce) throw new Error("Missing OIDC nonce");
+
+    // Send id_token to our server to create a session
+    const verifyRes = await fetch("/auth/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id_token: idToken, nonce }),
+    });
+    if (!verifyRes.ok) {
+      const text = await verifyRes.text();
+      throw new Error(text);
+    }
+
+    // Clean up
+    sessionStorage.removeItem("pkce_verifier");
+    sessionStorage.removeItem("pkce_state");
+    sessionStorage.removeItem("oidc_nonce");
+
+    // Redirect to app
+    location.href = "/";
+  } catch (e) {
+    status.textContent = "Authentication failed: " + e.message;
+  }
+})();
+</script>
+</body></html>`);
+});
+
+// /auth/verify — accepts an id_token from the browser, cryptographically
+// verifies the JWT signature against Azure AD's JWKS, validates all claims,
+// and sets a session cookie.
+app.use(express.json());
+app.post("/auth/verify", async (req, res) => {
+  try {
+    const { id_token, nonce } = req.body;
+    if (!id_token) { res.status(400).send("Missing id_token"); return; }
+    if (!nonce) { res.status(400).send("Missing nonce"); return; }
+
+    // Validate nonce was issued by this server and hasn't expired
+    const nonceExpiry = pendingNonces.get(nonce);
+    if (!nonceExpiry || Date.now() > nonceExpiry) {
+      pendingNonces.delete(nonce);
+      res.status(403).send("Invalid or expired nonce"); return;
+    }
+    // Delete nonce immediately — single use
+    pendingNonces.delete(nonce);
+
+    // Cryptographically verify JWT signature against Azure AD's public keys
+    // and validate issuer, audience, and expiration claims
+    const { payload } = await jwtVerify(id_token, JWKS, {
+      issuer: AUTH_ISSUER,
+      audience: AUTH_CLIENT_ID,
     });
 
-    const claims = result?.idTokenClaims as any;
-    const email = (claims?.preferred_username || claims?.email || claims?.upn || "").toLowerCase();
-
-    if (!email) {
-      res.status(403).send("Could not determine user email from token");
-      return;
+    // Validate the nonce claim in the token matches what we sent
+    if (payload.nonce !== nonce) {
+      res.status(403).send("Token nonce mismatch"); return;
     }
+
+    const email = ((payload.preferred_username || payload.email || payload.upn || "") as string).toLowerCase();
+    if (!email) { res.status(403).send("Could not determine user email from token"); return; }
 
     if (email !== AUTH_ALLOWED_USER) {
       console.warn(`[auth] denied login for: ${email} (allowed: ${AUTH_ALLOWED_USER})`);
@@ -274,17 +401,18 @@ app.get("/auth/callback", async (req, res) => {
     const token = createSessionToken(email);
     console.log(`[auth] user authenticated: ${email}`);
 
+    const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
     res.setHeader("Set-Cookie", serializeCookie("session_token", token, {
       httpOnly: true,
       secure: proto === "https",
-      sameSite: "lax",
+      sameSite: "strict",
       path: "/",
       maxAge: 24 * 60 * 60,
     }));
-    res.redirect("/");
+    res.json({ ok: true });
   } catch (e: any) {
-    console.error("[auth] token exchange failed:", e.message);
-    res.status(500).send("Authentication failed: " + e.message);
+    console.error("[auth] verify failed:", e.message);
+    res.status(500).send("Verification failed");
   }
 });
 
