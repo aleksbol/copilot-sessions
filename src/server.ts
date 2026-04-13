@@ -135,6 +135,46 @@ async function ensureClient() {
 // Track active SDK sessions: sessionId → CopilotSession
 const activeSessions = new Map<string, CopilotSession>();
 
+// ── Process tracking store ──
+
+interface TrackedProcess {
+  id: string;           // tool call ID from the SDK
+  sessionId: string;
+  name: string;         // tool name (e.g. "powershell", "bash")
+  command: string;      // the command that was run
+  intention: string;    // AI's stated intention
+  status: "running" | "done" | "failed";
+  output: string[];     // accumulated output lines
+  startedAt: string;    // ISO timestamp
+  completedAt?: string;
+  result?: string;      // final result summary
+}
+
+const processStore = new Map<string, TrackedProcess>();
+const MAX_PROCESSES = 100; // retain last N processes
+
+function pruneProcesses() {
+  if (processStore.size <= MAX_PROCESSES) return;
+  // Remove oldest completed processes first
+  const sorted = [...processStore.entries()]
+    .filter(([, p]) => p.status !== "running")
+    .sort((a, b) => (a[1].startedAt < b[1].startedAt ? -1 : 1));
+  while (processStore.size > MAX_PROCESSES && sorted.length > 0) {
+    const [id] = sorted.shift()!;
+    processStore.delete(id);
+  }
+}
+
+function broadcastToAll(data: Record<string, unknown>) {
+  const tagged = { ...data, _mid: ++msgSeq };
+  const json = JSON.stringify(tagged);
+  wss.clients.forEach((client: WebSocket) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(json);
+    }
+  });
+}
+
 // Per-session metadata (model) — persisted to disk so it survives restarts.
 // cwd is stored as a fallback cache; the SDK's SessionMetadata.context.cwd is
 // the preferred source (so sessions created by the CLI are handled correctly).
@@ -654,28 +694,56 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
         break;
 
       // ── Tool execution start ──
-      case "tool.execution_start":
+      case "tool.execution_start": {
+        const toolName = data.toolName ?? data.name ?? "unknown";
+        const args = data.arguments ?? data.args ?? data.input ?? {};
         broadcast(sessionId, {
           type: "tool_start",
           sessionId,
-          name: data.toolName ?? data.name ?? "unknown",
-          args: data.arguments ?? data.args ?? data.input ?? {},
+          name: toolName,
+          args,
           callId: event.id,
           intention: data.intention ?? "",
         });
+        // Track shell processes in the process store
+        if (["powershell", "bash", "shell"].includes(toolName)) {
+          const proc: TrackedProcess = {
+            id: event.id,
+            sessionId,
+            name: toolName,
+            command: typeof args === "object" ? (args.command ?? args.cmd ?? JSON.stringify(args)) : String(args),
+            intention: data.intention ?? "",
+            status: "running",
+            output: [],
+            startedAt: new Date().toISOString(),
+          };
+          processStore.set(event.id, proc);
+          pruneProcesses();
+          broadcastToAll({ type: "process_update", process: proc });
+        }
         break;
+      }
 
       // ── Tool execution complete ──
       case "tool.execution_complete": {
         const result = data.result ?? data.output ?? "";
+        const completedToolName = data.toolName ?? data.name ?? "unknown";
         broadcast(sessionId, {
           type: "tool_result",
           sessionId,
-          name: data.toolName ?? data.name ?? "unknown",
+          name: completedToolName,
           result: typeof result === "string" ? result : JSON.stringify(result),
           callId: event.id,
           parentId: event.parentId ?? undefined,
         });
+        // Update process store if tracked
+        const completedProc = processStore.get(event.id) ?? processStore.get(event.parentId ?? "");
+        if (completedProc) {
+          completedProc.status = "done";
+          completedProc.completedAt = new Date().toISOString();
+          completedProc.result = typeof result === "string" ? result.slice(0, 2000) : JSON.stringify(result).slice(0, 2000);
+          broadcastToAll({ type: "process_update", process: completedProc });
+        }
         break;
       }
 
@@ -691,14 +759,25 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
         break;
 
       // ── Tool partial results (e.g. streaming shell output) ──
-      case "tool.execution_partial_result":
+      case "tool.execution_partial_result": {
+        const partialOutput = data.partialOutput ?? "";
         broadcast(sessionId, {
           type: "tool_partial",
           sessionId,
           callId: data.toolCallId ?? event.id,
-          output: data.partialOutput ?? "",
+          output: partialOutput,
         });
+        // Append to process output if tracked
+        const partialProc = processStore.get(data.toolCallId ?? event.id);
+        if (partialProc && partialOutput) {
+          partialProc.output.push(typeof partialOutput === "string" ? partialOutput : JSON.stringify(partialOutput));
+          // Cap output buffer at 500 lines
+          if (partialProc.output.length > 500) {
+            partialProc.output = partialProc.output.slice(-400);
+          }
+        }
         break;
+      }
 
       // ── Permission events (contain rich context: commands, filenames, diffs) ──
       case "permission.requested":
@@ -1003,6 +1082,13 @@ wss.on("connection", (ws: any) => {
             return tb - ta;
           });
           send(ws, { type: "session_list", sessions: sessionList });
+          break;
+        }
+
+        // ── List tracked processes ──
+        case "list_processes": {
+          const processes = [...processStore.values()].sort((a, b) => (b.startedAt > a.startedAt ? 1 : -1));
+          send(ws, { type: "process_list", processes });
           break;
         }
 

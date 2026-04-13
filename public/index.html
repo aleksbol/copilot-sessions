@@ -60,6 +60,12 @@
             <path d="M11.93 8.5a4.002 4.002 0 0 1-7.86 0H.75a.75.75 0 0 1 0-1.5h3.32a4.002 4.002 0 0 1 7.86 0h3.32a.75.75 0 0 1 0 1.5Zm-1.43-.75a2.5 2.5 0 1 0-5 0 2.5 2.5 0 0 0 5 0Z"/>
           </svg>
         </button>
+        <button id="processes-btn" class="btn-icon processes-btn" title="View processes">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Zm1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25ZM3.5 5.25a.75.75 0 0 1 .75-.75h1a.75.75 0 0 1 0 1.5h-1a.75.75 0 0 1-.75-.75Zm.75 2.25a.75.75 0 0 0 0 1.5h3a.75.75 0 0 0 0-1.5Zm0 3a.75.75 0 0 0 0 1.5h1a.75.75 0 0 0 0-1.5Z"/>
+          </svg>
+          <span id="processes-badge" class="processes-badge" style="display:none">0</span>
+        </button>
       </div>
     </header>
 
@@ -112,6 +118,20 @@
     <div id="diff-content" class="diff-content"></div>
   </div>
   <div id="diff-overlay" class="diff-overlay" style="display:none"></div>
+
+  <!-- Processes panel -->
+  <div id="processes-panel" class="processes-panel" style="display:none">
+    <div class="processes-panel-header">
+      <h2>Processes</h2>
+      <div class="processes-panel-actions">
+        <button id="processes-close-btn" class="btn-icon" title="Close">✕</button>
+      </div>
+    </div>
+    <div id="processes-list" class="processes-list">
+      <div class="processes-empty">No processes yet</div>
+    </div>
+  </div>
+  <div id="processes-overlay" class="processes-overlay" style="display:none"></div>
 
   <script src="/app.js"></script>
 </body>

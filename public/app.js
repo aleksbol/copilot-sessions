@@ -20,6 +20,7 @@
   let reconnectAttempts = 0;
   const seenMessageIds = new Set();
   const reasoningBlocks = new Map(); // reasoningId → { block, contentEl, streaming }
+  const trackedProcesses = new Map(); // processId → process object
 
   // ── DOM refs ──
 
@@ -50,6 +51,12 @@
   const diffRefreshBtn = document.getElementById("diff-refresh-btn");
   const diffStatEl = document.getElementById("diff-stat");
   const diffContentEl = document.getElementById("diff-content");
+  const processesBtn = document.getElementById("processes-btn");
+  const processesPanel = document.getElementById("processes-panel");
+  const processesOverlay = document.getElementById("processes-overlay");
+  const processesCloseBtn = document.getElementById("processes-close-btn");
+  const processesListEl = document.getElementById("processes-list");
+  const processesBadge = document.getElementById("processes-badge");
 
   // ── Markdown setup ──
 
@@ -99,6 +106,7 @@
       hideThinkingIndicator();
       updateSendState();
       wsSend({ type: "list_sessions" });
+      wsSend({ type: "list_processes" });
       // Re-fetch current session history to pick up messages missed while disconnected
       if (currentSessionId) {
         console.log("[ws] reconnected — re-fetching session history");
@@ -415,6 +423,23 @@
         if (msg.sessionId === currentSessionId) {
           appendSessionInfo(msg.infoType, msg.message);
         }
+        break;
+
+      case "process_update":
+        if (msg.process) {
+          trackedProcesses.set(msg.process.id, msg.process);
+          updateProcessBadge();
+          renderProcessList();
+        }
+        break;
+
+      case "process_list":
+        trackedProcesses.clear();
+        for (const proc of (msg.processes || [])) {
+          trackedProcesses.set(proc.id, proc);
+        }
+        updateProcessBadge();
+        renderProcessList();
         break;
 
       case "done":
@@ -1562,6 +1587,130 @@
     diffStatEl.textContent = "";
     wsSend({ type: "get_diff", sessionId: currentSessionId });
   });
+
+  // ── Processes panel ──
+
+  function openProcessesPanel() {
+    processesPanel.style.display = "flex";
+    processesOverlay.style.display = "block";
+    wsSend({ type: "list_processes" });
+  }
+
+  function closeProcessesPanel() {
+    processesPanel.style.display = "none";
+    processesOverlay.style.display = "none";
+  }
+
+  processesBtn.addEventListener("click", openProcessesPanel);
+  processesCloseBtn.addEventListener("click", closeProcessesPanel);
+  processesOverlay.addEventListener("click", closeProcessesPanel);
+
+  function updateProcessBadge() {
+    const running = [...trackedProcesses.values()].filter(p => p.status === "running").length;
+    if (running > 0) {
+      processesBadge.textContent = running;
+      processesBadge.style.display = "flex";
+    } else {
+      processesBadge.style.display = "none";
+    }
+  }
+
+  function formatProcessTime(isoStr) {
+    if (!isoStr) return "";
+    const d = new Date(isoStr);
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+
+  function formatDuration(startIso, endIso) {
+    if (!startIso) return "";
+    const start = new Date(startIso).getTime();
+    const end = endIso ? new Date(endIso).getTime() : Date.now();
+    const secs = Math.round((end - start) / 1000);
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.floor(secs / 60);
+    const remSecs = secs % 60;
+    return `${mins}m ${remSecs}s`;
+  }
+
+  function renderProcessList() {
+    if (trackedProcesses.size === 0) {
+      processesListEl.innerHTML = '<div class="processes-empty">No processes yet</div>';
+      return;
+    }
+
+    const sorted = [...trackedProcesses.values()].sort((a, b) => (b.startedAt > a.startedAt ? 1 : -1));
+
+    // Preserve expanded state
+    const expandedIds = new Set();
+    processesListEl.querySelectorAll(".process-item.expanded").forEach(el => {
+      expandedIds.add(el.dataset.processId);
+    });
+
+    processesListEl.innerHTML = "";
+    for (const proc of sorted) {
+      const item = document.createElement("div");
+      item.className = "process-item" + (expandedIds.has(proc.id) ? " expanded" : "");
+      item.dataset.processId = proc.id;
+
+      const header = document.createElement("div");
+      header.className = "process-item-header";
+
+      const statusDot = document.createElement("span");
+      statusDot.className = `process-status-dot ${proc.status}`;
+
+      const info = document.createElement("div");
+      info.className = "process-info";
+
+      const cmdLine = document.createElement("div");
+      cmdLine.className = "process-command";
+      const cmdText = proc.command || "unknown command";
+      cmdLine.textContent = cmdText.length > 120 ? cmdText.slice(0, 117) + "…" : cmdText;
+      cmdLine.title = cmdText;
+
+      const meta = document.createElement("div");
+      meta.className = "process-meta";
+      const statusLabel = proc.status === "running" ? "Running" : proc.status === "done" ? "Completed" : "Failed";
+      const duration = formatDuration(proc.startedAt, proc.completedAt);
+      meta.innerHTML = `<span>${statusLabel}</span><span>${formatProcessTime(proc.startedAt)}</span>${duration ? `<span>${duration}</span>` : ""}`;
+
+      if (proc.intention) {
+        const intentionSpan = document.createElement("span");
+        intentionSpan.textContent = proc.intention;
+        intentionSpan.style.fontStyle = "italic";
+        meta.appendChild(intentionSpan);
+      }
+
+      info.appendChild(cmdLine);
+      info.appendChild(meta);
+
+      const chevron = document.createElement("span");
+      chevron.className = "process-chevron";
+      chevron.textContent = "▶";
+
+      header.appendChild(statusDot);
+      header.appendChild(info);
+      header.appendChild(chevron);
+
+      const output = document.createElement("div");
+      output.className = "process-output";
+      const pre = document.createElement("pre");
+      const outputText = (proc.output || []).join("");
+      pre.textContent = outputText || (proc.result || "(no output)");
+      output.appendChild(pre);
+
+      header.addEventListener("click", () => {
+        item.classList.toggle("expanded");
+        // Auto-scroll output to bottom when expanding
+        if (item.classList.contains("expanded")) {
+          requestAnimationFrame(() => { output.scrollTop = output.scrollHeight; });
+        }
+      });
+
+      item.appendChild(header);
+      item.appendChild(output);
+      processesListEl.appendChild(item);
+    }
+  }
 
   function renderDiffResult(msg) {
     if (msg.error) {
