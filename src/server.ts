@@ -585,6 +585,8 @@ function broadcast(sessionId: string, data: Record<string, unknown>, excludeWs?:
   // Don't buffer prompt events — they're re-sent via pendingPrompts on session switch
   const skipBuffer = data.type === "user_input_request" || data.type === "elicitation_request";
   if (!skipBuffer) appendToEventBuffer(sessionId, tagged);
+  // Turn ended — any pending prompt is no longer relevant
+  if (data.type === "done") pendingPrompts.delete(sessionId);
   const subs = sessionSubscribers.get(sessionId);
   if (!subs || subs.size === 0) return;
   const json = JSON.stringify(tagged);
