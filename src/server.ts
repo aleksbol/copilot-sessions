@@ -250,6 +250,25 @@ loadSessionMeta();
 // sessionId → boolean
 const turnDeliveredByEvents = new Map<string, boolean>();
 
+// Per-session event ring buffer for instant replay on session switch
+const EVENT_BUFFER_SIZE = 500;
+const sessionEventBuffers = new Map<string, any[]>();
+
+function appendToEventBuffer(sessionId: string, event: Record<string, unknown>) {
+  let buf = sessionEventBuffers.get(sessionId);
+  if (!buf) {
+    buf = [];
+    sessionEventBuffers.set(sessionId, buf);
+  }
+  buf.push(event);
+  if (buf.length > EVENT_BUFFER_SIZE) {
+    buf.splice(0, buf.length - EVENT_BUFFER_SIZE);
+  }
+}
+
+// Track which sessions have had events bound (prevent duplicate listeners)
+const boundSessionIds = new Set<string>();
+
 // Track which WebSocket clients are subscribed to which sessions
 // sessionId → Set<WebSocket>
 const sessionSubscribers = new Map<string, Set<WebSocket>>();
@@ -265,6 +284,10 @@ const clientConnections = new Map<string, WebSocket>();
 // requestId → { resolve }
 const pendingUserRequests = new Map<string, { resolve: (value: any) => void }>();
 let requestIdCounter = 0;
+
+// Track the most recent pending prompt per session so it can be re-sent on session switch
+// sessionId → the broadcast message object
+const pendingPrompts = new Map<string, any>();
 
 // ── Express + HTTP server ──
 
@@ -556,11 +579,14 @@ function send(ws: WebSocket, data: Record<string, unknown>) {
   }
 }
 
-/** Send a message to ALL clients subscribed to a session. */
+/** Send a message to ALL clients subscribed to a session. Also buffers for replay. */
 function broadcast(sessionId: string, data: Record<string, unknown>, excludeWs?: WebSocket) {
-  const subs = sessionSubscribers.get(sessionId);
-  if (!subs) return;
   const tagged = { ...data, _mid: ++msgSeq };
+  // Don't buffer prompt events — they're re-sent via pendingPrompts on session switch
+  const skipBuffer = data.type === "user_input_request" || data.type === "elicitation_request";
+  if (!skipBuffer) appendToEventBuffer(sessionId, tagged);
+  const subs = sessionSubscribers.get(sessionId);
+  if (!subs || subs.size === 0) return;
   const json = JSON.stringify(tagged);
   console.log(`[broadcast] ${data.type} to ${subs.size} client(s), mid=${tagged._mid}`);
   for (const ws of subs) {
@@ -614,14 +640,16 @@ function createUserInputHandler(sessionId: string) {
     return new Promise<any>((resolve) => {
       const reqId = `uir_${++requestIdCounter}`;
       pendingUserRequests.set(reqId, { resolve });
-      broadcast(sessionId, {
+      const promptMsg = {
         type: "user_input_request",
         sessionId,
         requestId: reqId,
         question: request.question ?? "",
         choices: request.choices ?? [],
         allowFreeform: request.allowFreeform ?? true,
-      });
+      };
+      pendingPrompts.set(sessionId, promptMsg);
+      broadcast(sessionId, promptMsg);
     });
   };
 }
@@ -631,7 +659,7 @@ function createElicitationHandler(sessionId: string) {
     return new Promise<any>((resolve) => {
       const reqId = `elic_${++requestIdCounter}`;
       pendingUserRequests.set(reqId, { resolve });
-      broadcast(sessionId, {
+      const promptMsg = {
         type: "elicitation_request",
         sessionId,
         requestId: reqId,
@@ -639,7 +667,9 @@ function createElicitationHandler(sessionId: string) {
         schema: context.requestedSchema ?? null,
         mode: context.mode ?? "form",
         source: context.elicitationSource ?? "",
-      });
+      };
+      pendingPrompts.set(sessionId, promptMsg);
+      broadcast(sessionId, promptMsg);
     });
   };
 }
@@ -649,6 +679,11 @@ function createElicitationHandler(sessionId: string) {
  * This is called once per session (not per client).
  */
 function bindSessionEvents(session: CopilotSession, sessionId: string) {
+  if (boundSessionIds.has(sessionId)) {
+    console.log(`[session] events already bound for ${sessionId.substring(0, 8)}, skipping`);
+    return;
+  }
+  boundSessionIds.add(sessionId);
   session.on((event: SessionEvent) => {
     const data = event.data as any;
 
@@ -1183,6 +1218,7 @@ wss.on("connection", (ws: any) => {
             if (errMsg.includes("Session not found") || errMsg.includes("session not found")) {
               console.log(`[message] session lost in CLI — attempting re-resume...`);
               activeSessions.delete(msg.sessionId);
+              boundSessionIds.delete(msg.sessionId);
               try {
                 const reSession = await copilot.resumeSession(msg.sessionId, {
                   streaming: true,
@@ -1271,8 +1307,9 @@ wss.on("connection", (ws: any) => {
           const sessionId = msg.sessionId;
           console.log(`[session] resuming: ${sessionId}`);
 
-          // If already active in memory, just send history
+          // If already active in memory, just subscribe and replay buffered events
           let session = activeSessions.get(sessionId);
+          const wasAlreadyActive = !!session;
 
           if (!session) {
             // Resume via SDK — this reconnects to the CLI's persisted session
@@ -1299,18 +1336,25 @@ wss.on("connection", (ws: any) => {
           // Subscribe this client to the session's broadcasts
           subscribeToSession(ws, sessionId);
 
-          // Fetch and send history (retry on transient "Session not found" errors)
-          // If all retries fail, do a fresh re-resume to fully activate the session and try once more.
-          {
+          // Fast path: session already active with buffered events → replay buffer
+          // Slow path: cold session (just resumed from CLI) → fetch from getMessages()
+          if (wasAlreadyActive && sessionEventBuffers.has(sessionId)) {
+            const buf = sessionEventBuffers.get(sessionId)!;
+            console.log(`[session] replaying ${buf.length} buffered event(s) for ${sessionId.substring(0, 8)}`);
+            const history = bufferToHistory(buf);
+            send(ws, { type: "session_history", sessionId, messages: history });
+          } else {
+            // Fetch and send history (retry on transient "Session not found" errors)
+            // If all retries fail, do a fresh re-resume to fully activate the session and try once more.
             const maxAttempts = 4;
             const retryDelayMs = 800;
-            let historyFetched = false;
             for (let attempt = 1; attempt <= maxAttempts; attempt++) {
               try {
                 const events = await session.getMessages();
                 const history = eventsToHistory(events);
                 send(ws, { type: "session_history", sessionId, messages: history });
-                historyFetched = true;
+                // Seed the event buffer from CLI history so future switches use the fast path
+                seedBufferFromHistory(sessionId, history);
                 break;
               } catch (e: any) {
                 const isNotFound = e.message?.includes("Session not found") || e.message?.includes("session not found");
@@ -1319,8 +1363,8 @@ wss.on("connection", (ws: any) => {
                   await new Promise(res => setTimeout(res, retryDelayMs));
                 } else {
                   console.warn(`[session] getMessages retries exhausted: ${e.message} — trying fresh re-resume...`);
-                  // Fresh re-resume: create a new session object to fully activate the CLI connection
                   try {
+                    boundSessionIds.delete(sessionId);
                     const reSession = await copilot.resumeSession(sessionId, {
                       streaming: true,
                       onPermissionRequest: approveAll,
@@ -1332,7 +1376,7 @@ wss.on("connection", (ws: any) => {
                     const events2 = await reSession.getMessages();
                     const history2 = eventsToHistory(events2);
                     send(ws, { type: "session_history", sessionId, messages: history2 });
-                    historyFetched = true;
+                    seedBufferFromHistory(sessionId, history2);
                     console.log(`[session] history fetched after fresh re-resume`);
                   } catch (reErr: any) {
                     console.warn(`[session] fresh re-resume getMessages also failed: ${reErr.message}`);
@@ -1352,6 +1396,14 @@ wss.on("connection", (ws: any) => {
             cwd,
             model: meta?.model ?? "",
           });
+
+          // Re-send any pending prompt (ask_user / elicitation) so the UI can render it
+          const pendingPrompt = pendingPrompts.get(sessionId);
+          if (pendingPrompt) {
+            console.log(`[session] re-sending pending ${pendingPrompt.type} for ${sessionId.substring(0, 8)}`);
+            send(ws, pendingPrompt);
+          }
+
           console.log(`[session] resumed: ${sessionId}, cwd=${cwd}, model=${meta?.model}`);
           break;
         }
@@ -1364,6 +1416,9 @@ wss.on("connection", (ws: any) => {
             try { await session.disconnect(); } catch {}
             activeSessions.delete(sessionId);
           }
+          boundSessionIds.delete(sessionId);
+          sessionEventBuffers.delete(sessionId);
+          turnDeliveredByEvents.delete(sessionId);
           try {
             await copilot.deleteSession(sessionId);
           } catch (e: any) {
@@ -1509,6 +1564,8 @@ wss.on("connection", (ws: any) => {
           const pending = pendingUserRequests.get(msg.requestId);
           if (pending) {
             pendingUserRequests.delete(msg.requestId);
+            // Clear the pending prompt for this session
+            if (msg.sessionId) pendingPrompts.delete(msg.sessionId);
             pending.resolve({
               answer: msg.answer ?? "",
               wasFreeform: msg.wasFreeform ?? true,
@@ -1522,6 +1579,7 @@ wss.on("connection", (ws: any) => {
           const pending = pendingUserRequests.get(msg.requestId);
           if (pending) {
             pendingUserRequests.delete(msg.requestId);
+            if (msg.sessionId) pendingPrompts.delete(msg.sessionId);
             pending.resolve({
               action: msg.action ?? "cancel",
               content: msg.content ?? {},
@@ -1608,6 +1666,99 @@ function eventsToHistory(events: SessionEvent[]): any[] {
     }
   }
 
+  return messages;
+}
+
+/**
+ * Seed the event buffer from CLI history so the fast-path replay
+ * includes messages that existed before this server session started.
+ * Converts session_history messages into broadcast-format events.
+ */
+function seedBufferFromHistory(sessionId: string, history: any[]) {
+  // Only seed if buffer is empty or doesn't exist yet — don't overwrite live events
+  if (sessionEventBuffers.has(sessionId) && sessionEventBuffers.get(sessionId)!.length > 0) return;
+  const buf: any[] = [];
+  for (const msg of history) {
+    switch (msg.role) {
+      case "user":
+        buf.push({ type: "user_message", sessionId, content: msg.content });
+        break;
+      case "assistant":
+        if (msg.content) {
+          buf.push({ type: "assistant_message", sessionId, content: msg.content });
+        }
+        break;
+      case "tool_call":
+        buf.push({ type: "tool_start", sessionId, name: msg.name, args: msg.args, callId: msg.callId, intention: msg.intention });
+        break;
+      case "tool_result":
+        buf.push({ type: "tool_result", sessionId, name: msg.name, result: msg.result, callId: msg.callId, parentId: msg.parentId });
+        break;
+    }
+  }
+  sessionEventBuffers.set(sessionId, buf);
+  console.log(`[session] seeded buffer with ${buf.length} event(s) from CLI history for ${sessionId.substring(0, 8)}`);
+}
+function bufferToHistory(buffer: any[]): any[] {
+  const messages: any[] = [];
+  let pendingTokens = "";
+
+  function flushTokens() {
+    if (pendingTokens) {
+      messages.push({ role: "assistant", content: pendingTokens });
+      pendingTokens = "";
+    }
+  }
+
+  for (const evt of buffer) {
+    switch (evt.type) {
+      case "user_message":
+        flushTokens();
+        messages.push({ role: "user", content: evt.content ?? "" });
+        break;
+
+      case "assistant_message":
+        flushTokens();
+        if (evt.content) {
+          messages.push({ role: "assistant", content: evt.content });
+        }
+        break;
+
+      case "token":
+        pendingTokens += evt.text ?? "";
+        break;
+
+      case "turn_start":
+        flushTokens();
+        break;
+
+      case "done":
+        flushTokens();
+        break;
+
+      case "tool_start":
+        flushTokens();
+        messages.push({
+          role: "tool_call",
+          name: evt.name ?? "unknown",
+          args: evt.args ?? {},
+          callId: evt.callId,
+          intention: evt.intention ?? "",
+        });
+        break;
+
+      case "tool_result":
+        messages.push({
+          role: "tool_result",
+          name: evt.name ?? "unknown",
+          result: evt.result ?? "",
+          callId: evt.callId,
+          parentId: evt.parentId,
+        });
+        break;
+    }
+  }
+  flushTokens();
   return messages;
 }
 

@@ -340,6 +340,13 @@
         if (msg.sessionId === currentSessionId) {
           clearMessages();
           renderHistory(msg.messages || []);
+          // History received means the session is idle — always clear streaming state
+          streamingSessionIds.delete(msg.sessionId);
+          isStreaming = false;
+          streamingBubble = null;
+          streamingBuffer = "";
+          hideThinkingIndicator();
+          updateSendState();
         }
         break;
 
@@ -741,6 +748,12 @@
   function renderHistory(messages) {
     clearMessages();
 
+    // Collect all tool_result callIds so we can detect unanswered ask_user prompts
+    const answeredCallIds = new Set();
+    for (const m of messages) {
+      if (m.role === "tool_result") answeredCallIds.add(m.parentId || m.callId);
+    }
+
     let lastRole = null;
     for (const msg of messages) {
       switch (msg.role) {
@@ -753,9 +766,13 @@
             appendAssistantMessage(msg.content, showTs ? msg.timestamp : null);
           }
           break;
-        case "tool_call":
+        case "tool_call": {
+          // Skip unanswered ask_user — the server re-sends the interactive prompt
+          const toolName = (msg.name || "").toLowerCase().replace(/[^a-z0-9_]/g, "_");
+          if (toolName === "ask_user" && !answeredCallIds.has(msg.callId)) break;
           appendToolStart(msg.name, msg.args, msg.callId, msg.intention);
           break;
+        }
         case "tool_result":
           updateToolResult(msg.parentId || msg.callId, msg.result, msg.name);
           break;
