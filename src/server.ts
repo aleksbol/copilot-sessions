@@ -779,12 +779,16 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           if (isBackgroundLaunch) {
             console.log(`[process] ${completedProc.id} is a background/detached process — marking as detached`);
             completedProc.status = "detached";
-            completedProc.result = resultStr.slice(0, 2000);
+            completedProc.result = completedProc.output.length > 0
+              ? completedProc.output.join("")
+              : resultStr.slice(0, 50000);
             broadcastToAll({ type: "process_update", process: completedProc });
           } else {
             completedProc.status = "done";
             completedProc.completedAt = new Date().toISOString();
-            completedProc.result = resultStr.slice(0, 2000);
+            completedProc.result = completedProc.output.length > 0
+              ? completedProc.output.join("")
+              : resultStr.slice(0, 50000);
             broadcastToAll({ type: "process_update", process: completedProc });
           }
         }
@@ -817,8 +821,8 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
         console.log(`[process] PARTIAL key=${partialKey} found=${!!partialProc} storeKeys=[${[...processStore.keys()].join(",")}]`);
         if (partialProc && partialOutput) {
           partialProc.output.push(typeof partialOutput === "string" ? partialOutput : JSON.stringify(partialOutput));
-          if (partialProc.output.length > 500) {
-            partialProc.output = partialProc.output.slice(-400);
+          if (partialProc.output.length > 5000) {
+            partialProc.output = partialProc.output.slice(-4000);
           }
         }
         break;
