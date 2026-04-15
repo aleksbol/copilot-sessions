@@ -20,6 +20,28 @@ dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), ".
 const PORT = parseInt(process.env.PORT || "3847", 10);
 const DEFAULT_CWD = process.env.COPILOT_CWD || process.cwd();
 
+// ── MCP server config ──
+
+function loadMcpServers(): Record<string, any> | undefined {
+  const configPath = path.join(process.env.USERPROFILE || process.env.HOME || "", ".copilot", "mcp-config.json");
+  try {
+    if (fs.existsSync(configPath)) {
+      const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      const servers = raw.mcpServers || {};
+      const count = Object.keys(servers).length;
+      if (count > 0) {
+        console.log(`[mcp] Loaded ${count} MCP server(s) from ${configPath}: ${Object.keys(servers).join(", ")}`);
+        return servers;
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[mcp] Failed to load MCP config from ${configPath}: ${err.message}`);
+  }
+  return undefined;
+}
+
+const mcpServers = loadMcpServers();
+
 // ── Auth config ──
 
 const AUTH_TENANT_ID = process.env.AUTH_TENANT_ID || "";
@@ -1021,6 +1043,7 @@ wss.on("connection", (ws: any) => {
             onPermissionRequest: approveAll,
             onUserInputRequest: createUserInputHandler(msg.sessionId || "pending"),
             onElicitationRequest: createElicitationHandler(msg.sessionId || "pending"),
+            ...(mcpServers ? { mcpServers } : {}),
           });
 
           const sessionId = session.sessionId;
@@ -1227,6 +1250,7 @@ wss.on("connection", (ws: any) => {
                   onPermissionRequest: approveAll,
                   onUserInputRequest: createUserInputHandler(msg.sessionId),
                   onElicitationRequest: createElicitationHandler(msg.sessionId),
+                  ...(mcpServers ? { mcpServers } : {}),
                 });
                 activeSessions.set(msg.sessionId, reSession);
                 bindSessionEvents(reSession, msg.sessionId);
@@ -1321,6 +1345,7 @@ wss.on("connection", (ws: any) => {
                 onPermissionRequest: approveAll,
                 onUserInputRequest: createUserInputHandler(sessionId),
                 onElicitationRequest: createElicitationHandler(sessionId),
+                ...(mcpServers ? { mcpServers } : {}),
               });
             } catch (resumeErr: any) {
               console.error(`[session] resume failed:`, resumeErr);
@@ -1372,6 +1397,7 @@ wss.on("connection", (ws: any) => {
                       onPermissionRequest: approveAll,
                       onUserInputRequest: createUserInputHandler(sessionId),
                       onElicitationRequest: createElicitationHandler(sessionId),
+                      ...(mcpServers ? { mcpServers } : {}),
                     });
                     activeSessions.set(sessionId, reSession);
                     bindSessionEvents(reSession, sessionId);
