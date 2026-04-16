@@ -255,15 +255,19 @@ function saveSessionMeta() {
   }
 }
 
-/** Fetch the working directory for a session. Prefers SDK metadata, falls back to local cache. */
+/** Fetch the working directory for a session. Prefers local cache (set at creation), falls back to SDK metadata. */
 async function getSessionCwd(sessionId: string): Promise<string> {
+  // Local cache is set at creation time with the correct cwd
+  const localCwd = sessionMeta.get(sessionId)?.cwd;
+  if (localCwd) return localCwd;
+  // Fall back to SDK metadata for sessions created before local caching
   try {
     const sdkMeta = await copilot.getSessionMetadata(sessionId);
     if (sdkMeta?.context?.cwd) return sdkMeta.context.cwd;
   } catch (e: any) {
     console.warn(`[meta] could not fetch cwd for ${sessionId}: ${e.message}`);
   }
-  return sessionMeta.get(sessionId)?.cwd ?? "";
+  return "";
 }
 
 loadSessionMeta();
