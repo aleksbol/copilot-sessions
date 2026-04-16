@@ -25,6 +25,7 @@
   let loopActive = false;
   const loopingSessions = new Set(); // sessionIds with active loops
   let menuHideTimer = null;
+  let notificationsEnabled = localStorage.getItem("notificationsEnabled") !== "false"; // default on
 
   // ── DOM refs ──
 
@@ -66,6 +67,45 @@
   const loopIndicator = document.getElementById("loop-indicator");
   const loopIndicatorText = document.getElementById("loop-indicator-text");
   const loopStopBtn = document.getElementById("loop-stop-btn");
+  const notifyBtn = document.getElementById("notify-btn");
+
+  // ── Browser Notifications ──
+
+  function updateNotifyBtn() {
+    if (!notifyBtn) return;
+    notifyBtn.classList.toggle("notify-off", !notificationsEnabled);
+    notifyBtn.title = notificationsEnabled ? "Notifications on (click to disable)" : "Notifications off (click to enable)";
+  }
+  updateNotifyBtn();
+
+  if (notifyBtn) {
+    notifyBtn.addEventListener("click", async () => {
+      if (!notificationsEnabled) {
+        // Turning on — request permission if needed
+        if ("Notification" in window && Notification.permission === "default") {
+          const perm = await Notification.requestPermission();
+          if (perm !== "granted") return; // denied, stay off
+        }
+        notificationsEnabled = true;
+      } else {
+        notificationsEnabled = false;
+      }
+      localStorage.setItem("notificationsEnabled", String(notificationsEnabled));
+      updateNotifyBtn();
+    });
+  }
+
+  function showDoneNotification(sessionId) {
+    if (!notificationsEnabled || !("Notification" in window) || Notification.permission !== "granted") return;
+    if (!document.hidden) return; // only notify when tab is not visible
+    const session = sessions.find(s => s.sessionId === sessionId);
+    const title = session?.title || "Session";
+    const n = new Notification("Copilot finished", {
+      body: title,
+      tag: `copilot-done-${sessionId}`, // de-duplicate
+    });
+    n.onclick = () => { window.focus(); n.close(); };
+  }
 
   // ── Markdown setup ──
 
@@ -498,6 +538,7 @@
           const doneSession = sessions.find(s => s.sessionId === msg.sessionId);
           if (doneSession) { doneSession.updatedAt = new Date().toISOString(); renderSessionList(); }
         }
+        showDoneNotification(msg.sessionId);
         if (msg.sessionId === currentSessionId) {
           hideThinkingIndicator();
           finishStreaming(msg.sessionId);

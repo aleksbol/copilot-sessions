@@ -1785,6 +1785,27 @@ body {
   padding: 0 4px;
 }
 
+.notify-btn {
+  color: var(--text-secondary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  transition: color 0.15s;
+}
+
+.notify-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.notify-btn.notify-off {
+  opacity: 0.4;
+}
+
 /* ── Mobile ── */
 
 @media (max-width: 768px) {
