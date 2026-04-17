@@ -9,6 +9,7 @@
     "tunnel": "devtunnel host"
   },
   "dependencies": {
+    "@github/copilot": "^1.0.31",
     "@github/copilot-sdk": "latest",
     "@types/cookie": "^0.6.0",
     "cookie": "^1.1.1",

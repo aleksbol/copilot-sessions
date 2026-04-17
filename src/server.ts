@@ -1039,7 +1039,7 @@ wss.on("connection", (ws: any) => {
           const cwd = msg.cwd || DEFAULT_CWD;
           const model = msg.model || defaultModel;
 
-          console.log(`[session] creating: model=${model} cwd=${cwd}`);
+          console.log(`[session] creating: model=${model} cwd=${cwd}${msg.reasoningEffort ? ` reasoning=${msg.reasoningEffort}` : ""}`);
           const session = await copilot.createSession({
             model,
             streaming: true,
@@ -1048,6 +1048,7 @@ wss.on("connection", (ws: any) => {
             onUserInputRequest: createUserInputHandler(msg.sessionId || "pending"),
             onElicitationRequest: createElicitationHandler(msg.sessionId || "pending"),
             ...(mcpServers ? { mcpServers } : {}),
+            ...(msg.reasoningEffort ? { reasoningEffort: msg.reasoningEffort } : {}),
           });
 
           const sessionId = session.sessionId;
