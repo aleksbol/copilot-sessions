@@ -85,43 +85,69 @@ function deleteSnapshot(id: string): boolean {
 }
 
 function historyToSystemMessage(history: any[]): string {
-  // Target ~30k chars (~8k tokens) to stay well within context limits
   const MAX_CHARS = 30_000;
-  const PREAMBLE = "You are continuing from a previous session snapshot. Here is a summary of the conversation context:\n\n";
+  const SUMMARY_BUDGET = 10_000;  // chars for topic summary section
+  const RECENT_BUDGET = 18_000;   // chars for recent messages section
 
-  const parts: string[] = [];
+  // 1) Build a topic summary from ALL user messages (condensed)
+  const topics: string[] = [];
   for (const msg of history) {
-    if (msg.role === "user") {
-      // Keep user messages (truncate long ones)
-      const content = (msg.content || "").substring(0, 1000);
-      parts.push(`User: ${content}${msg.content?.length > 1000 ? "..." : ""}`);
-    } else if (msg.role === "assistant") {
-      // Keep assistant messages (truncate long ones)
-      const content = (msg.content || "").substring(0, 1000);
-      parts.push(`Assistant: ${content}${msg.content?.length > 1000 ? "..." : ""}`);
+    if (msg.role === "user" && msg.content) {
+      // First 200 chars of each user message captures the ask
+      const line = msg.content.substring(0, 200).replace(/\n+/g, " ").trim();
+      if (line) topics.push(`- ${line}${msg.content.length > 200 ? "..." : ""}`);
+    }
+  }
+  let summarySection = "## Topics discussed\n" + topics.join("\n");
+  if (summarySection.length > SUMMARY_BUDGET) {
+    // Keep the last topics that fit
+    summarySection = "## Topics discussed (most recent)\n";
+    let built = "";
+    for (let i = topics.length - 1; i >= 0; i--) {
+      const candidate = topics[i] + "\n" + built;
+      if (candidate.length > SUMMARY_BUDGET - 50) break;
+      built = candidate;
+    }
+    summarySection += built;
+  }
+
+  // 2) Build detailed recent messages (user + assistant, skip tool noise)
+  const recentParts: string[] = [];
+  for (const msg of history) {
+    if (msg.role === "user" && msg.content) {
+      const content = msg.content.substring(0, 2000);
+      recentParts.push(`**User:** ${content}${msg.content.length > 2000 ? "..." : ""}`);
+    } else if (msg.role === "assistant" && msg.content) {
+      const content = msg.content.substring(0, 2000);
+      recentParts.push(`**Assistant:** ${content}${msg.content.length > 2000 ? "..." : ""}`);
     } else if (msg.role === "tool_call") {
-      // Compact tool call summary
-      parts.push(`[Tool: ${msg.name}]`);
-    } else if (msg.role === "tool_result") {
-      // Skip tool results entirely — they're the bulk of the size
-      continue;
+      recentParts.push(`[Tool: ${msg.name}]`);
     }
+    // Skip tool_result — too large
   }
 
-  // Build from the end (most recent messages are most important)
-  let result = "";
-  for (let i = parts.length - 1; i >= 0; i--) {
-    const candidate = parts[i] + "\n\n" + result;
-    if (candidate.length > MAX_CHARS) {
-      break;
-    }
-    result = candidate;
+  // Take as many recent messages as fit in budget (from the end)
+  let recentSection = "";
+  for (let i = recentParts.length - 1; i >= 0; i--) {
+    const candidate = recentParts[i] + "\n\n" + recentSection;
+    if (candidate.length > RECENT_BUDGET) break;
+    recentSection = candidate;
   }
 
-  if (!result.trim()) {
-    return PREAMBLE + "(Session had no readable messages)";
+  const omitted = recentParts.length - recentSection.split("\n\n").filter(Boolean).length;
+
+  const preamble = `You are continuing from a previous session snapshot.
+The snapshot contains a summary of all topics discussed followed by the most recent messages in full detail.
+${omitted > 0 ? `(${omitted} earlier messages omitted for space)\n` : ""}`;
+
+  let result = preamble + "\n" + summarySection.trim() + "\n\n## Recent conversation\n" + recentSection.trim();
+
+  // Hard cap safety
+  if (result.length > MAX_CHARS) {
+    result = result.substring(result.length - MAX_CHARS);
   }
-  return PREAMBLE + result.trim();
+
+  return result;
 }
 
 // ── Auth config ──
