@@ -68,6 +68,13 @@
   const loopIndicatorText = document.getElementById("loop-indicator-text");
   const loopStopBtn = document.getElementById("loop-stop-btn");
   const notifyBtn = document.getElementById("notify-btn");
+  const snapshotBtn = document.getElementById("snapshot-btn");
+  const snapshotDialog = document.getElementById("snapshot-dialog");
+  const snapshotNameInput = document.getElementById("snapshot-name-input");
+  const snapshotDescInput = document.getElementById("snapshot-desc-input");
+  const snapshotCancel = document.getElementById("snapshot-cancel");
+  const snapshotSave = document.getElementById("snapshot-save");
+  const newSnapshotSelect = document.getElementById("new-snapshot-select");
 
   // ── Browser Notifications ──
 
@@ -105,6 +112,136 @@
       tag: `copilot-done-${sessionId}`, // de-duplicate
     });
     n.onclick = () => { window.focus(); n.close(); };
+  }
+
+  // ── Snapshots ──
+
+  let snapshots = []; // cached list from server
+
+  async function fetchSnapshots() {
+    try {
+      const res = await fetch("/api/snapshots");
+      if (res.ok) snapshots = await res.json();
+    } catch {}
+    populateSnapshotSelect();
+  }
+
+  function populateSnapshotSelect() {
+    if (!newSnapshotSelect) return;
+    newSnapshotSelect.innerHTML = '<option value="">None (blank session)</option>';
+    for (const s of snapshots) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = s.name + (s.description ? ` — ${s.description}` : "");
+      newSnapshotSelect.appendChild(opt);
+    }
+    // Add manage option if there are snapshots
+    if (snapshots.length > 0) {
+      const sep = document.createElement("option");
+      sep.disabled = true;
+      sep.textContent = "────────────";
+      newSnapshotSelect.appendChild(sep);
+      const manage = document.createElement("option");
+      manage.value = "__manage__";
+      manage.textContent = "🗑 Manage snapshots...";
+      newSnapshotSelect.appendChild(manage);
+    }
+  }
+
+  // Show/hide snapshot button based on active session
+  function updateSnapshotBtn() {
+    if (snapshotBtn) snapshotBtn.style.display = currentSessionId ? "" : "none";
+  }
+
+  if (snapshotBtn) {
+    snapshotBtn.addEventListener("click", () => {
+      if (!currentSessionId) return;
+      snapshotNameInput.value = "";
+      snapshotDescInput.value = "";
+      snapshotDialog.style.display = "";
+      snapshotNameInput.focus();
+    });
+  }
+
+  if (snapshotCancel) {
+    snapshotCancel.addEventListener("click", () => {
+      snapshotDialog.style.display = "none";
+    });
+  }
+
+  if (snapshotSave) {
+    snapshotSave.addEventListener("click", () => {
+      const name = snapshotNameInput.value.trim();
+      if (!name) { snapshotNameInput.focus(); return; }
+      wsSend({
+        type: "save_snapshot",
+        sessionId: currentSessionId,
+        name,
+        description: snapshotDescInput.value.trim(),
+      });
+      snapshotDialog.style.display = "none";
+    });
+  }
+
+  if (snapshotDialog) {
+    snapshotDialog.addEventListener("click", (e) => {
+      if (e.target === snapshotDialog) snapshotDialog.style.display = "none";
+    });
+  }
+
+  // Handle manage snapshots
+  if (newSnapshotSelect) {
+    newSnapshotSelect.addEventListener("change", () => {
+      if (newSnapshotSelect.value === "__manage__") {
+        newSnapshotSelect.value = "";
+        showManageSnapshots();
+      }
+    });
+  }
+
+  function showManageSnapshots() {
+    const dialog = document.createElement("div");
+    dialog.className = "dialog-overlay";
+    dialog.innerHTML = `
+      <div class="dialog" style="max-width:500px">
+        <h3>Manage Snapshots</h3>
+        <div class="snapshot-list">${snapshots.map(s => `
+          <div class="snapshot-item" data-id="${s.id}">
+            <div class="snapshot-item-info">
+              <strong>${s.name}</strong>
+              ${s.description ? `<span class="snapshot-item-desc">${s.description}</span>` : ""}
+              <span class="snapshot-item-date">${new Date(s.createdAt).toLocaleDateString()}</span>
+            </div>
+            <button class="snapshot-delete-btn" title="Delete">✕</button>
+          </div>`).join("")}
+          ${snapshots.length === 0 ? "<p>No snapshots saved yet.</p>" : ""}
+        </div>
+        <div class="dialog-actions">
+          <button class="dialog-btn dialog-btn-secondary snapshot-manage-close">Close</button>
+        </div>
+      </div>`;
+    document.body.appendChild(dialog);
+
+    dialog.querySelector(".snapshot-manage-close").addEventListener("click", () => {
+      dialog.remove();
+    });
+    dialog.addEventListener("click", (e) => {
+      if (e.target === dialog) dialog.remove();
+    });
+    dialog.querySelectorAll(".snapshot-delete-btn").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const item = btn.closest(".snapshot-item");
+        const id = item.dataset.id;
+        try {
+          const res = await fetch(`/api/snapshots/${id}`, { method: "DELETE" });
+          if (res.ok) {
+            item.remove();
+            snapshots = snapshots.filter(s => s.id !== id);
+            populateSnapshotSelect();
+          }
+        } catch {}
+      });
+    });
   }
 
   // ── Markdown setup ──
@@ -374,6 +511,7 @@
         closeSidebar();
         messageInput.focus();
         updateSendState();
+        updateSnapshotBtn();
         break;
 
       case "session_history":
@@ -552,6 +690,7 @@
           closeSidebar();
           messageInput.focus();
           updateSendState();
+          updateSnapshotBtn();
         }
         break;
 
@@ -625,6 +764,12 @@
         if (msg.sessionId === currentSessionId) {
           renderElicitationRequest(msg);
         }
+        break;
+
+      case "snapshot_saved":
+        // Refresh snapshots list and show confirmation
+        fetchSnapshots();
+        appendSessionInfo("snapshot", `Snapshot saved: "${msg.snapshot.name}"`);
         break;
     }
   }
@@ -1469,6 +1614,7 @@
   sidebarOverlay.addEventListener("click", closeSidebar);
 
   newSessionBtn.addEventListener("click", () => {
+    fetchSnapshots(); // refresh snapshot list
     newSessionDialog.style.display = "";
     newCwdInput.focus();
   });
@@ -1480,7 +1626,8 @@
   newSessionCreate.addEventListener("click", () => {
     const cwd = newCwdInput.value.trim() || undefined;
     const model = newModelSelect.value;
-    wsSend({ type: "new_session", cwd, model });
+    const snapshotId = newSnapshotSelect?.value || undefined;
+    wsSend({ type: "new_session", cwd, model, ...(snapshotId ? { snapshotId } : {}) });
     newSessionDialog.style.display = "none";
   });
 
@@ -2062,6 +2209,7 @@
   connect();
   updateSendState();
   fetchModels();
+  fetchSnapshots();
 
   // Fetch available models from the server and populate dropdowns
   async function fetchModels() {

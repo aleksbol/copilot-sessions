@@ -42,6 +42,65 @@ function loadMcpServers(): Record<string, any> | undefined {
 
 const mcpServers = loadMcpServers();
 
+// ── Snapshots ──
+
+interface Snapshot {
+  id: string;
+  name: string;
+  description?: string;
+  systemMessage: string;
+  model?: string;
+  cwd?: string;
+  sourceSessionId?: string;
+  createdAt: string;
+}
+
+const SNAPSHOTS_DIR = path.join(process.env.USERPROFILE || process.env.HOME || "", ".copilot", "snapshots");
+
+function ensureSnapshotsDir() {
+  if (!fs.existsSync(SNAPSHOTS_DIR)) fs.mkdirSync(SNAPSHOTS_DIR, { recursive: true });
+}
+
+function loadSnapshots(): Snapshot[] {
+  ensureSnapshotsDir();
+  const files = fs.readdirSync(SNAPSHOTS_DIR).filter(f => f.endsWith(".json"));
+  const snaps: Snapshot[] = [];
+  for (const f of files) {
+    try {
+      snaps.push(JSON.parse(fs.readFileSync(path.join(SNAPSHOTS_DIR, f), "utf-8")));
+    } catch {}
+  }
+  return snaps.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+function saveSnapshot(snap: Snapshot) {
+  ensureSnapshotsDir();
+  fs.writeFileSync(path.join(SNAPSHOTS_DIR, `${snap.id}.json`), JSON.stringify(snap, null, 2));
+}
+
+function deleteSnapshot(id: string): boolean {
+  const file = path.join(SNAPSHOTS_DIR, `${id}.json`);
+  if (fs.existsSync(file)) { fs.unlinkSync(file); return true; }
+  return false;
+}
+
+function historyToSystemMessage(history: any[]): string {
+  const parts: string[] = [];
+  for (const msg of history) {
+    if (msg.role === "user") {
+      parts.push(`User: ${msg.content}`);
+    } else if (msg.role === "assistant") {
+      parts.push(`Assistant: ${msg.content}`);
+    } else if (msg.role === "tool_call") {
+      parts.push(`[Tool call: ${msg.name}(${typeof msg.args === "string" ? msg.args : JSON.stringify(msg.args).substring(0, 200)})]`);
+    } else if (msg.role === "tool_result") {
+      const preview = (msg.result || "").substring(0, 500);
+      parts.push(`[Tool result: ${msg.name} → ${preview}${msg.result?.length > 500 ? "..." : ""}]`);
+    }
+  }
+  return `You are continuing from a previous session snapshot. Here is the conversation context:\n\n${parts.join("\n\n")}`;
+}
+
 // ── Auth config ──
 
 const AUTH_TENANT_ID = process.env.AUTH_TENANT_ID || "";
@@ -573,6 +632,16 @@ app.get("/api/models", async (_req, res) => {
   }
 });
 
+// API endpoints: snapshots
+app.get("/api/snapshots", (_req, res) => {
+  res.json(loadSnapshots().map(s => ({ id: s.id, name: s.name, description: s.description, model: s.model, cwd: s.cwd, createdAt: s.createdAt })));
+});
+
+app.delete("/api/snapshots/:id", (req, res) => {
+  if (deleteSnapshot(req.params.id)) res.json({ ok: true });
+  else res.status(404).json({ error: "Snapshot not found" });
+});
+
 const server = http.createServer(app);
 
 // ── WebSocket server (with auth gate on upgrade) ──
@@ -1039,7 +1108,18 @@ wss.on("connection", (ws: any) => {
           const cwd = msg.cwd || DEFAULT_CWD;
           const model = msg.model || defaultModel;
 
-          console.log(`[session] creating: model=${model} cwd=${cwd}${msg.reasoningEffort ? ` reasoning=${msg.reasoningEffort}` : ""}`);
+          // Load snapshot system message if creating from a snapshot
+          let systemMessage: string | undefined;
+          if (msg.snapshotId) {
+            const snaps = loadSnapshots();
+            const snap = snaps.find(s => s.id === msg.snapshotId);
+            if (snap) {
+              systemMessage = snap.systemMessage;
+              console.log(`[session] using snapshot "${snap.name}" (${snap.id})`);
+            }
+          }
+
+          console.log(`[session] creating: model=${model} cwd=${cwd}${msg.reasoningEffort ? ` reasoning=${msg.reasoningEffort}` : ""}${systemMessage ? " (from snapshot)" : ""}`);
           const session = await copilot.createSession({
             model,
             streaming: true,
@@ -1049,6 +1129,7 @@ wss.on("connection", (ws: any) => {
             onElicitationRequest: createElicitationHandler(msg.sessionId || "pending"),
             ...(mcpServers ? { mcpServers } : {}),
             ...(msg.reasoningEffort ? { reasoningEffort: msg.reasoningEffort } : {}),
+            ...(systemMessage ? { systemMessage: { mode: "append" as const, content: systemMessage } } : {}),
           });
 
           const sessionId = session.sessionId;
@@ -1511,6 +1592,37 @@ wss.on("connection", (ws: any) => {
             });
           } catch (e: any) {
             send(ws, { type: "error", sessionId: msg.sessionId, message: `Model change failed: ${e.message}` });
+          }
+          break;
+        }
+
+        // ── Save snapshot from session ──
+        case "save_snapshot": {
+          const session = activeSessions.get(msg.sessionId);
+          if (!session) {
+            send(ws, { type: "error", sessionId: msg.sessionId, message: "Session not active — cannot save snapshot." });
+            break;
+          }
+          try {
+            const events = await session.getMessages();
+            const history = eventsToHistory(events);
+            const systemMessage = historyToSystemMessage(history);
+            const meta = sessionMeta.get(msg.sessionId);
+            const snap: Snapshot = {
+              id: crypto.randomBytes(8).toString("hex"),
+              name: msg.name || "Untitled Snapshot",
+              description: msg.description || "",
+              systemMessage,
+              model: meta?.model,
+              cwd: meta?.cwd,
+              sourceSessionId: msg.sessionId,
+              createdAt: new Date().toISOString(),
+            };
+            saveSnapshot(snap);
+            console.log(`[snapshot] saved "${snap.name}" (${snap.id}) from session ${msg.sessionId.substring(0, 8)} — ${systemMessage.length} chars`);
+            send(ws, { type: "snapshot_saved", snapshot: { id: snap.id, name: snap.name, description: snap.description, createdAt: snap.createdAt } });
+          } catch (e: any) {
+            send(ws, { type: "error", sessionId: msg.sessionId, message: `Snapshot failed: ${e.message}` });
           }
           break;
         }

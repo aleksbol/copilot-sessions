@@ -1806,6 +1806,83 @@ body {
   opacity: 0.4;
 }
 
+.snapshot-btn {
+  color: var(--text-secondary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+}
+
+.snapshot-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.dialog-hint {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  margin: 0 0 12px 0;
+}
+
+.snapshot-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.snapshot-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+}
+
+.snapshot-item-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.snapshot-item-info strong {
+  font-size: 0.9rem;
+}
+
+.snapshot-item-desc {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.snapshot-item-date {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.snapshot-delete-btn {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 4px 8px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.snapshot-delete-btn:hover {
+  color: #f85149;
+  background: rgba(248, 81, 73, 0.1);
+}
+
 /* ── Mobile ── */
 
 @media (max-width: 768px) {
