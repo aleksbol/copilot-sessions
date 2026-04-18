@@ -85,20 +85,43 @@ function deleteSnapshot(id: string): boolean {
 }
 
 function historyToSystemMessage(history: any[]): string {
+  // Target ~30k chars (~8k tokens) to stay well within context limits
+  const MAX_CHARS = 30_000;
+  const PREAMBLE = "You are continuing from a previous session snapshot. Here is a summary of the conversation context:\n\n";
+
   const parts: string[] = [];
   for (const msg of history) {
     if (msg.role === "user") {
-      parts.push(`User: ${msg.content}`);
+      // Keep user messages (truncate long ones)
+      const content = (msg.content || "").substring(0, 1000);
+      parts.push(`User: ${content}${msg.content?.length > 1000 ? "..." : ""}`);
     } else if (msg.role === "assistant") {
-      parts.push(`Assistant: ${msg.content}`);
+      // Keep assistant messages (truncate long ones)
+      const content = (msg.content || "").substring(0, 1000);
+      parts.push(`Assistant: ${content}${msg.content?.length > 1000 ? "..." : ""}`);
     } else if (msg.role === "tool_call") {
-      parts.push(`[Tool call: ${msg.name}(${typeof msg.args === "string" ? msg.args : JSON.stringify(msg.args).substring(0, 200)})]`);
+      // Compact tool call summary
+      parts.push(`[Tool: ${msg.name}]`);
     } else if (msg.role === "tool_result") {
-      const preview = (msg.result || "").substring(0, 500);
-      parts.push(`[Tool result: ${msg.name} → ${preview}${msg.result?.length > 500 ? "..." : ""}]`);
+      // Skip tool results entirely — they're the bulk of the size
+      continue;
     }
   }
-  return `You are continuing from a previous session snapshot. Here is the conversation context:\n\n${parts.join("\n\n")}`;
+
+  // Build from the end (most recent messages are most important)
+  let result = "";
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const candidate = parts[i] + "\n\n" + result;
+    if (candidate.length > MAX_CHARS) {
+      break;
+    }
+    result = candidate;
+  }
+
+  if (!result.trim()) {
+    return PREAMBLE + "(Session had no readable messages)";
+  }
+  return PREAMBLE + result.trim();
 }
 
 // ── Auth config ──
