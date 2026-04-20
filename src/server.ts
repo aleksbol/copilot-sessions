@@ -223,18 +223,35 @@ async function indexSession(sessionId: string, sessionInfo?: any): Promise<boole
     if (!session) {
       try {
         session = await copilot.resumeSession(sessionId, {
-          streaming: false,
+          streaming: true,
           onPermissionRequest: approveAll,
-        } as any);
+        });
         tempSession = true;
       } catch {
         return false;
       }
     }
 
-    const msgs = await session.getMessages();
+    let msgs: any[];
+    try {
+      msgs = await session.getMessages();
+    } catch (e: any) {
+      console.warn(`[search] getMessages failed for ${sessionId.substring(0, 8)}: ${e.message}`);
+      msgs = [];
+    }
     if (tempSession) {
       try { await session.disconnect(); } catch {}
+    }
+
+    const extracted = extractSearchMessages(msgs);
+    console.log(`[search] session ${sessionId.substring(0, 8)}: raw=${msgs.length} events, extracted=${extracted.length} msgs`);
+
+    // Skip if no messages retrieved (don't overwrite existing data with empty)
+    if (extracted.length === 0 && existing && existing.messages.length > 0) {
+      return false;
+    }
+    if (extracted.length === 0) {
+      return false; // nothing to index
     }
 
     const meta = sessionMeta.get(sessionId);
@@ -243,7 +260,7 @@ async function indexSession(sessionId: string, sessionInfo?: any): Promise<boole
       model: meta?.model ?? sessionInfo?.model ?? "",
       cwd: meta?.cwd ?? sessionInfo?.context?.cwd ?? "",
       updatedAt,
-      messages: extractSearchMessages(msgs),
+      messages: extracted,
     };
 
     searchIndex.set(sessionId, entry);
@@ -1886,12 +1903,29 @@ wss.on("connection", (ws: any) => {
             const fetchHistory = async (): Promise<boolean> => {
               const maxAttempts = 4;
               const retryDelayMs = 800;
+              const indexFromHistory = (history: any[]) => {
+                // Update search index with full message history
+                const entry: SearchIndexEntry = {
+                  title: sessionMeta.get(sessionId)?.name ?? "Session",
+                  model: sessionMeta.get(sessionId)?.model ?? "",
+                  cwd: sessionMeta.get(sessionId)?.cwd ?? "",
+                  updatedAt: new Date().toISOString(),
+                  messages: history
+                    .filter((m: any) => (m.role === "user" || m.role === "assistant") && m.content)
+                    .map((m: any) => ({ role: m.role, content: String(m.content).substring(0, 2000) })),
+                };
+                if (entry.messages.length > 0) {
+                  searchIndex.set(sessionId, entry);
+                  scheduleIndexSave();
+                }
+              };
               for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                 try {
                   const events = await session!.getMessages();
                   const history = eventsToHistory(events);
                   send(ws, { type: "session_history", sessionId, messages: history });
                   seedBufferFromHistory(sessionId, history);
+                  indexFromHistory(history);
                   return true;
                 } catch (e: any) {
                   const isNotFound = e.message?.includes("Session not found") || e.message?.includes("session not found");
@@ -1916,6 +1950,7 @@ wss.on("connection", (ws: any) => {
                       const history2 = eventsToHistory(events2);
                       send(ws, { type: "session_history", sessionId, messages: history2 });
                       seedBufferFromHistory(sessionId, history2);
+                      indexFromHistory(history2);
                       console.log(`[session] history fetched after fresh re-resume`);
                       return true;
                     } catch (reErr: any) {
