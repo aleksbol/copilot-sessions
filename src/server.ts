@@ -1832,7 +1832,7 @@ wss.on("connection", (ws: any) => {
             return {
               sessionId: s.sessionId ?? s.id,
               title: meta?.name ?? s.title ?? s.name ?? "Session",
-              cwd: s.context?.cwd ?? "",
+              cwd: meta?.cwd ?? s.context?.cwd ?? "",
               model: meta?.model ?? s.model ?? "",
               createdAt: s.startTime ?? s.createdAt ?? "",
               updatedAt: s.lastActiveTime ?? s.updatedAt ?? "",
@@ -2021,7 +2021,7 @@ wss.on("connection", (ws: any) => {
             return {
               sessionId: s.sessionId ?? s.id,
               title: meta2?.name ?? s.title ?? s.name ?? "Session",
-              cwd: s.context?.cwd ?? "",
+              cwd: meta2?.cwd ?? s.context?.cwd ?? "",
               model: meta2?.model ?? s.model ?? "",
               createdAt: s.startTime ?? s.createdAt ?? "",
               updatedAt: s.lastActiveTime ?? s.updatedAt ?? "",
