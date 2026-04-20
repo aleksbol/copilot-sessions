@@ -1554,56 +1554,66 @@ wss.on("connection", (ws: any) => {
           // Subscribe this client to the session's broadcasts
           subscribeToSession(ws, sessionId);
 
-          // Fast path: session already active with buffered events → replay buffer
-          // Slow path: cold session (just resumed from CLI) → fetch from getMessages()
-          if (wasAlreadyActive && sessionEventBuffers.has(sessionId)) {
-            const buf = sessionEventBuffers.get(sessionId)!;
-            console.log(`[session] replaying ${buf.length} buffered event(s) for ${sessionId.substring(0, 8)}`);
-            const history = bufferToHistory(buf);
-            send(ws, { type: "session_history", sessionId, messages: history });
-          } else {
-            // Fetch and send history (retry on transient "Session not found" errors)
-            // If all retries fail, do a fresh re-resume to fully activate the session and try once more.
-            const maxAttempts = 4;
-            const retryDelayMs = 800;
-            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-              try {
-                const events = await session.getMessages();
-                const history = eventsToHistory(events);
-                send(ws, { type: "session_history", sessionId, messages: history });
-                // Seed the event buffer from CLI history so future switches use the fast path
-                seedBufferFromHistory(sessionId, history);
-                break;
-              } catch (e: any) {
-                const isNotFound = e.message?.includes("Session not found") || e.message?.includes("session not found");
-                if (isNotFound && attempt < maxAttempts) {
-                  console.warn(`[session] getMessages attempt ${attempt} failed ("Session not found"), retrying in ${retryDelayMs}ms...`);
-                  await new Promise(res => setTimeout(res, retryDelayMs));
-                } else {
-                  console.warn(`[session] getMessages retries exhausted: ${e.message} — trying fresh re-resume...`);
-                  try {
-                    boundSessionIds.delete(sessionId);
-                    const reSession = await copilot.resumeSession(sessionId, {
-                      streaming: true,
-                      onPermissionRequest: approveAll,
-                      onUserInputRequest: createUserInputHandler(sessionId),
-                      onElicitationRequest: createElicitationHandler(sessionId),
-                      ...(mcpServers ? { mcpServers } : {}),
-                    });
-                    activeSessions.set(sessionId, reSession);
-                    bindSessionEvents(reSession, sessionId);
-                    const events2 = await reSession.getMessages();
-                    const history2 = eventsToHistory(events2);
-                    send(ws, { type: "session_history", sessionId, messages: history2 });
-                    seedBufferFromHistory(sessionId, history2);
-                    console.log(`[session] history fetched after fresh re-resume`);
-                  } catch (reErr: any) {
-                    console.warn(`[session] fresh re-resume getMessages also failed: ${reErr.message}`);
-                    send(ws, { type: "session_history", sessionId, messages: [] });
+          // Always fetch full history from SDK (buffer may be truncated).
+          // Fall back to buffer replay only if getMessages() fails.
+          {
+            const fetchHistory = async (): Promise<boolean> => {
+              const maxAttempts = 4;
+              const retryDelayMs = 800;
+              for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                  const events = await session!.getMessages();
+                  const history = eventsToHistory(events);
+                  send(ws, { type: "session_history", sessionId, messages: history });
+                  seedBufferFromHistory(sessionId, history);
+                  return true;
+                } catch (e: any) {
+                  const isNotFound = e.message?.includes("Session not found") || e.message?.includes("session not found");
+                  if (isNotFound && attempt < maxAttempts) {
+                    console.warn(`[session] getMessages attempt ${attempt} failed ("Session not found"), retrying in ${retryDelayMs}ms...`);
+                    await new Promise(res => setTimeout(res, retryDelayMs));
+                  } else if (isNotFound) {
+                    console.warn(`[session] getMessages retries exhausted: ${e.message} — trying fresh re-resume...`);
+                    try {
+                      boundSessionIds.delete(sessionId);
+                      const reSession = await copilot.resumeSession(sessionId, {
+                        streaming: true,
+                        onPermissionRequest: approveAll,
+                        onUserInputRequest: createUserInputHandler(sessionId),
+                        onElicitationRequest: createElicitationHandler(sessionId),
+                        ...(mcpServers ? { mcpServers } : {}),
+                      });
+                      activeSessions.set(sessionId, reSession);
+                      session = reSession;
+                      bindSessionEvents(reSession, sessionId);
+                      const events2 = await reSession.getMessages();
+                      const history2 = eventsToHistory(events2);
+                      send(ws, { type: "session_history", sessionId, messages: history2 });
+                      seedBufferFromHistory(sessionId, history2);
+                      console.log(`[session] history fetched after fresh re-resume`);
+                      return true;
+                    } catch (reErr: any) {
+                      console.warn(`[session] fresh re-resume getMessages also failed: ${reErr.message}`);
+                      return false;
+                    }
+                  } else {
+                    console.warn(`[session] getMessages failed (non-transient): ${e.message}`);
+                    return false;
                   }
-                  break;
                 }
               }
+              return false;
+            };
+
+            const gotHistory = await fetchHistory();
+            if (!gotHistory && sessionEventBuffers.has(sessionId)) {
+              // Fallback: replay whatever we have in the buffer
+              const buf = sessionEventBuffers.get(sessionId)!;
+              console.log(`[session] falling back to buffer replay: ${buf.length} event(s) for ${sessionId.substring(0, 8)}`);
+              const history = bufferToHistory(buf);
+              send(ws, { type: "session_history", sessionId, messages: history });
+            } else if (!gotHistory) {
+              send(ws, { type: "session_history", sessionId, messages: [] });
             }
           }
 
