@@ -1248,6 +1248,7 @@ wss.on("connection", (ws: any) => {
           // sendAndWait blocks until the turn completes and returns the final message.
           // The session.on() listener does NOT receive assistant.message/turn_start/turn_end
           // in current SDK versions — so we rely on the return value for the response.
+          let lastContent = "";
           try {
             const result = await session.sendAndWait(
               { prompt },
@@ -1278,7 +1279,7 @@ wss.on("connection", (ws: any) => {
             // ── Loop mode continuation ──
             const loopState = activeLoops.get(msg.sessionId);
             if (loopState?.active) {
-              let lastContent = content || "";
+              lastContent = content || "";
 
               // Loop until agent signals done/blocked, or loop is aborted
               while (loopState.active && activeLoops.has(msg.sessionId)) {
@@ -1361,19 +1362,6 @@ wss.on("connection", (ws: any) => {
             console.error(`[message] sendAndWait error:`, sendErr);
             const errMsg = sendErr?.message ?? String(sendErr);
 
-            // If loop was active, end it on error
-            if (activeLoops.has(msg.sessionId)) {
-              const ls = activeLoops.get(msg.sessionId)!;
-              activeLoops.delete(msg.sessionId);
-              broadcast(msg.sessionId, {
-                type: "loop_ended",
-                sessionId: msg.sessionId,
-                status: "error",
-                reason: errMsg,
-                iterations: ls.iteration,
-              });
-            }
-
             // If CLI lost the session, clear stale state and auto-retry resume + send
             if (errMsg.includes("Session not found") || errMsg.includes("session not found")) {
               console.log(`[message] session lost in CLI — attempting re-resume...`);
@@ -1392,7 +1380,7 @@ wss.on("connection", (ws: any) => {
                 console.log(`[message] re-resumed, retrying send...`);
 
                 const retryResult = await reSession.sendAndWait(
-                  { prompt: msg.content },
+                  { prompt },
                   600_000,
                 );
                 const retryData = retryResult?.data as any;
@@ -1403,9 +1391,70 @@ wss.on("connection", (ws: any) => {
                   broadcast(msg.sessionId, { type: "assistant_message", sessionId: msg.sessionId, content: retryContent });
                   broadcast(msg.sessionId, { type: "done", sessionId: msg.sessionId });
                 }
+
+                // If loop mode, continue the loop after successful re-resume
+                const loopStateAfterResume = activeLoops.get(msg.sessionId);
+                if (loopStateAfterResume?.active) {
+                  lastContent = retryContent;
+                  // Fall through — but we can't re-enter the while loop from here,
+                  // so run the loop inline
+                  while (loopStateAfterResume.active && activeLoops.has(msg.sessionId)) {
+                    const loopStatus = parseLoopStatus(lastContent);
+                    if (loopStatus) {
+                      console.log(`[loop] ended: status=${loopStatus.status} reason=${loopStatus.reason ?? "none"} iterations=${loopStateAfterResume.iteration}`);
+                      activeLoops.delete(msg.sessionId);
+                      broadcast(msg.sessionId, {
+                        type: "loop_ended",
+                        sessionId: msg.sessionId,
+                        status: loopStatus.status,
+                        reason: loopStatus.reason ?? "",
+                        iterations: loopStateAfterResume.iteration,
+                      });
+                      break;
+                    }
+
+                    loopStateAfterResume.iteration++;
+                    console.log(`[loop] iteration ${loopStateAfterResume.iteration} (after re-resume)`);
+                    broadcast(msg.sessionId, {
+                      type: "loop_iteration",
+                      sessionId: msg.sessionId,
+                      iteration: loopStateAfterResume.iteration,
+                      delay: loopStateAfterResume.throttleDelay,
+                    });
+                    const delayMs = loopStateAfterResume.throttleDelay;
+                    loopStateAfterResume.throttleDelay = Math.min(loopStateAfterResume.throttleDelay * 2, LOOP_MAX_DELAY);
+
+                    await new Promise(res => setTimeout(res, delayMs));
+                    if (!loopStateAfterResume.active || !activeLoops.has(msg.sessionId)) break;
+
+                    broadcast(msg.sessionId, { type: "user_message", sessionId: msg.sessionId, content: "[Loop continuation]" });
+                    try {
+                      const contResult = await reSession.sendAndWait({ prompt: LOOP_CONTINUATION }, 600_000);
+                      const contData = contResult?.data as any;
+                      lastContent = contData?.content ?? "";
+                      const contEvH = turnDeliveredByEvents.get(msg.sessionId) ?? false;
+                      turnDeliveredByEvents.set(msg.sessionId, false);
+                      if (!contEvH && lastContent) {
+                        broadcast(msg.sessionId, { type: "assistant_message", sessionId: msg.sessionId, content: lastContent });
+                        broadcast(msg.sessionId, { type: "done", sessionId: msg.sessionId });
+                      }
+                    } catch (loopErr: any) {
+                      console.error(`[loop] continuation error after re-resume:`, loopErr.message);
+                      activeLoops.delete(msg.sessionId);
+                      broadcast(msg.sessionId, { type: "loop_ended", sessionId: msg.sessionId, status: "error", reason: loopErr.message, iterations: loopStateAfterResume.iteration });
+                      break;
+                    }
+                  }
+                }
                 break;
               } catch (retryErr: any) {
                 console.error(`[message] re-resume failed:`, retryErr);
+                // If loop was active, end it
+                if (activeLoops.has(msg.sessionId)) {
+                  const ls = activeLoops.get(msg.sessionId)!;
+                  activeLoops.delete(msg.sessionId);
+                  broadcast(msg.sessionId, { type: "loop_ended", sessionId: msg.sessionId, status: "error", reason: retryErr?.message ?? String(retryErr), iterations: ls.iteration });
+                }
                 send(ws, {
                   type: "error",
                   sessionId: msg.sessionId,
@@ -1413,6 +1462,13 @@ wss.on("connection", (ws: any) => {
                 });
                 break;
               }
+            }
+
+            // Non-recoverable error — end loop if active
+            if (activeLoops.has(msg.sessionId)) {
+              const ls = activeLoops.get(msg.sessionId)!;
+              activeLoops.delete(msg.sessionId);
+              broadcast(msg.sessionId, { type: "loop_ended", sessionId: msg.sessionId, status: "error", reason: errMsg, iterations: ls.iteration });
             }
 
             send(ws, {
