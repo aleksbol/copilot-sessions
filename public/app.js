@@ -75,6 +75,12 @@
   const snapshotCancel = document.getElementById("snapshot-cancel");
   const snapshotSave = document.getElementById("snapshot-save");
   const newSnapshotSelect = document.getElementById("new-snapshot-select");
+  const searchInput = document.getElementById("search-input");
+  const searchClear = document.getElementById("search-clear");
+  const searchResults = document.getElementById("search-results");
+  const searchModeKeyword = document.getElementById("search-mode-keyword");
+  const searchModeAi = document.getElementById("search-mode-ai");
+  const searchScope = document.getElementById("search-scope");
 
   // ── Browser Notifications ──
 
@@ -242,6 +248,187 @@
         } catch {}
       });
     });
+  }
+
+  // ── Search ──
+
+  let searchMode = "keyword"; // "keyword" or "ai"
+  let searchDebounceTimer = null;
+  let activeSearchAbort = null;
+
+  if (searchInput) {
+    searchInput.addEventListener("input", () => {
+      const q = searchInput.value.trim();
+      searchClear.style.display = q ? "block" : "none";
+      if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+      if (!q) {
+        clearSearchResults();
+        return;
+      }
+      if (searchMode === "keyword") {
+        searchDebounceTimer = setTimeout(() => doKeywordSearch(q), 300);
+      }
+    });
+
+    searchInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && searchInput.value.trim()) {
+        if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+        if (searchMode === "ai") {
+          doAiSearch(searchInput.value.trim());
+        } else {
+          doKeywordSearch(searchInput.value.trim());
+        }
+      }
+      if (e.key === "Escape") {
+        searchInput.value = "";
+        searchClear.style.display = "none";
+        clearSearchResults();
+      }
+    });
+  }
+
+  if (searchClear) {
+    searchClear.addEventListener("click", () => {
+      searchInput.value = "";
+      searchClear.style.display = "none";
+      clearSearchResults();
+      searchInput.focus();
+    });
+  }
+
+  if (searchModeKeyword) {
+    searchModeKeyword.addEventListener("click", () => {
+      searchMode = "keyword";
+      searchModeKeyword.classList.add("active");
+      searchModeAi.classList.remove("active");
+      searchInput.placeholder = "Search conversations…";
+      if (searchInput.value.trim()) doKeywordSearch(searchInput.value.trim());
+    });
+  }
+
+  if (searchModeAi) {
+    searchModeAi.addEventListener("click", () => {
+      searchMode = "ai";
+      searchModeAi.classList.add("active");
+      searchModeKeyword.classList.remove("active");
+      searchInput.placeholder = "Ask about your conversations… (Enter to search)";
+    });
+  }
+
+  function clearSearchResults() {
+    if (activeSearchAbort) { activeSearchAbort.abort(); activeSearchAbort = null; }
+    searchResults.style.display = "none";
+    searchResults.innerHTML = "";
+    sessionListEl.style.display = "";
+  }
+
+  async function doKeywordSearch(query) {
+    if (activeSearchAbort) activeSearchAbort.abort();
+    const ctrl = new AbortController();
+    activeSearchAbort = ctrl;
+    const scope = searchScope.value;
+    const url = `/api/search?q=${encodeURIComponent(query)}&scope=${scope}${scope === "current" && currentSessionId ? `&sessionId=${currentSessionId}` : ""}`;
+    try {
+      const res = await fetch(url, { signal: ctrl.signal });
+      if (!res.ok) return;
+      const data = await res.json();
+      renderSearchResults(data.results, query, "keyword");
+    } catch (e) {
+      if (e.name !== "AbortError") console.warn("[search]", e);
+    }
+  }
+
+  async function doAiSearch(query) {
+    if (activeSearchAbort) activeSearchAbort.abort();
+    const ctrl = new AbortController();
+    activeSearchAbort = ctrl;
+
+    // Show loading
+    searchResults.style.display = "";
+    sessionListEl.style.display = "none";
+    searchResults.innerHTML = `<div class="search-loading"><div class="spinner"></div>AI searching…</div>`;
+
+    const scope = searchScope.value;
+    try {
+      const res = await fetch("/api/search/ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, scope, sessionId: currentSessionId }),
+        signal: ctrl.signal,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        searchResults.innerHTML = `<div class="search-empty">AI search error: ${err.error || "unknown"}</div>`;
+        return;
+      }
+      const data = await res.json();
+      if (data.raw) {
+        // Model returned non-JSON — show as prose
+        searchResults.innerHTML = `<div class="search-result-item" style="cursor:default; border-left-color: var(--accent);">
+          <div class="search-result-snippet">${escapeHtml(data.answer)}</div>
+        </div>`;
+        return;
+      }
+      renderSearchResults(data.results, query, "ai");
+    } catch (e) {
+      if (e.name !== "AbortError") {
+        searchResults.innerHTML = `<div class="search-empty">Search failed</div>`;
+      }
+    }
+  }
+
+  function renderSearchResults(results, query, mode) {
+    searchResults.style.display = "";
+    sessionListEl.style.display = "none";
+
+    if (!results || results.length === 0) {
+      searchResults.innerHTML = `<div class="search-empty">No results found</div>`;
+      return;
+    }
+
+    const header = `<div class="search-results-header"><span>${results.length} result${results.length !== 1 ? "s" : ""}</span></div>`;
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+
+    const items = results.map(r => {
+      const snippet = r.snippet || "";
+      // Highlight search terms in snippet for keyword mode
+      let highlightedSnippet = escapeHtml(snippet);
+      if (mode === "keyword") {
+        for (const term of terms) {
+          const re = new RegExp(`(${escapeRegex(term)})`, "gi");
+          highlightedSnippet = highlightedSnippet.replace(re, "<mark>$1</mark>");
+        }
+      }
+
+      const roleLabel = r.role ? `<div class="search-result-role">${r.role}</div>` : "";
+      const relevance = r.relevance ? `<div class="search-result-relevance">${escapeHtml(r.relevance)}</div>` : "";
+
+      return `<div class="search-result-item" data-session-id="${r.sessionId}" onclick="window.__searchNavigate('${r.sessionId}')">
+        <div class="search-result-title">${escapeHtml(r.title || "Session")}</div>
+        ${roleLabel}
+        <div class="search-result-snippet">${highlightedSnippet}</div>
+        ${relevance}
+      </div>`;
+    }).join("");
+
+    searchResults.innerHTML = header + items;
+  }
+
+  // Expose search navigation globally so inline onclick works
+  window.__searchNavigate = function(sessionId) {
+    // Clear search and navigate to the session
+    searchInput.value = "";
+    searchClear.style.display = "none";
+    clearSearchResults();
+    resumeSession(sessionId);
+  };
+
+  function escapeHtml(str) {
+    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
   // ── Markdown setup ──

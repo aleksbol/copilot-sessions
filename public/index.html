@@ -19,6 +19,21 @@
       <h2>Sessions</h2>
       <button id="new-session-btn" class="btn-icon" title="New session">＋</button>
     </div>
+    <div class="search-bar">
+      <div class="search-input-wrap">
+        <input id="search-input" type="text" placeholder="Search conversations…" autocomplete="off" />
+        <button id="search-clear" class="search-clear" title="Clear search" style="display:none">×</button>
+      </div>
+      <div class="search-controls">
+        <button id="search-mode-keyword" class="search-mode active" title="Keyword search">🔍</button>
+        <button id="search-mode-ai" class="search-mode" title="AI search">🤖</button>
+        <select id="search-scope" class="search-scope">
+          <option value="all">All sessions</option>
+          <option value="current">Current session</option>
+        </select>
+      </div>
+    </div>
+    <div id="search-results" class="search-results" style="display:none"></div>
     <div id="session-list" class="session-list"></div>
   </aside>
 

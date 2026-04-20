@@ -150,6 +150,230 @@ ${omitted > 0 ? `(${omitted} earlier messages omitted for space)\n` : ""}`;
   return result;
 }
 
+// ── Search index ──
+
+interface SearchIndexEntry {
+  title: string;
+  model: string;
+  cwd: string;
+  updatedAt: string;
+  messages: Array<{ role: "user" | "assistant"; content: string; timestamp?: string }>;
+}
+
+const SEARCH_INDEX_FILE = path.join(process.env.USERPROFILE || process.env.HOME || "", ".copilot", "search-index.json");
+const searchIndex = new Map<string, SearchIndexEntry>();
+let searchIndexReady = false;
+
+function loadSearchIndex() {
+  try {
+    if (fs.existsSync(SEARCH_INDEX_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SEARCH_INDEX_FILE, "utf-8"));
+      for (const [k, v] of Object.entries(data)) {
+        searchIndex.set(k, v as SearchIndexEntry);
+      }
+      console.log(`[search] loaded index with ${searchIndex.size} session(s)`);
+    }
+  } catch (e: any) {
+    console.warn(`[search] failed to load index: ${e.message}`);
+  }
+}
+
+function saveSearchIndex() {
+  try {
+    const dir = path.dirname(SEARCH_INDEX_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const obj: Record<string, SearchIndexEntry> = {};
+    for (const [k, v] of searchIndex) obj[k] = v;
+    fs.writeFileSync(SEARCH_INDEX_FILE, JSON.stringify(obj));
+  } catch (e: any) {
+    console.warn(`[search] failed to save index: ${e.message}`);
+  }
+}
+
+/** Extract user/assistant messages from SDK message array */
+function extractSearchMessages(msgs: any[]): SearchIndexEntry["messages"] {
+  const result: SearchIndexEntry["messages"] = [];
+  for (const m of msgs) {
+    if ((m.role === "user" || m.role === "assistant") && m.content) {
+      const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      // Truncate to 2000 chars per message for index size management
+      result.push({
+        role: m.role,
+        content: content.substring(0, 2000),
+        timestamp: m.timestamp,
+      });
+    }
+  }
+  return result;
+}
+
+/** Update the search index for a single session */
+async function indexSession(sessionId: string, sessionInfo?: any): Promise<boolean> {
+  try {
+    // Check if already indexed and up-to-date
+    const existing = searchIndex.get(sessionId);
+    const updatedAt = sessionInfo?.lastActiveTime ?? sessionInfo?.updatedAt ?? "";
+    if (existing && existing.updatedAt && updatedAt && existing.updatedAt === updatedAt) {
+      return false; // already current
+    }
+
+    // Resume session temporarily to get messages
+    let session = activeSessions.get(sessionId);
+    let tempSession = false;
+    if (!session) {
+      try {
+        session = await copilot.resumeSession(sessionId, {
+          streaming: false,
+          onPermissionRequest: approveAll,
+        } as any);
+        tempSession = true;
+      } catch {
+        return false;
+      }
+    }
+
+    const msgs = await session.getMessages();
+    if (tempSession) {
+      try { await session.disconnect(); } catch {}
+    }
+
+    const meta = sessionMeta.get(sessionId);
+    const entry: SearchIndexEntry = {
+      title: meta?.name ?? sessionInfo?.title ?? sessionInfo?.name ?? "Session",
+      model: meta?.model ?? sessionInfo?.model ?? "",
+      cwd: meta?.cwd ?? sessionInfo?.context?.cwd ?? "",
+      updatedAt,
+      messages: extractSearchMessages(msgs),
+    };
+
+    searchIndex.set(sessionId, entry);
+    return true;
+  } catch (e: any) {
+    console.warn(`[search] failed to index session ${sessionId}: ${e.message}`);
+    return false;
+  }
+}
+
+/** Background: index all sessions. Runs without blocking startup. */
+async function buildSearchIndex() {
+  try {
+    await ensureClient();
+    const allSessions = await copilot.listSessions();
+    console.log(`[search] indexing ${allSessions.length} session(s) in background...`);
+
+    let indexed = 0;
+    let skipped = 0;
+    for (const s of allSessions) {
+      const sid = (s as any).sessionId ?? (s as any).id;
+      try {
+        const wasNew = await indexSession(sid, s);
+        if (wasNew) indexed++;
+        else skipped++;
+      } catch {
+        // continue with next session
+      }
+      // Yield to event loop every 3 sessions to avoid blocking
+      if ((indexed + skipped) % 3 === 0) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+    }
+
+    // Remove entries for sessions that no longer exist
+    const validIds = new Set(allSessions.map((s: any) => s.sessionId ?? s.id));
+    for (const id of searchIndex.keys()) {
+      if (!validIds.has(id)) searchIndex.delete(id);
+    }
+
+    saveSearchIndex();
+    searchIndexReady = true;
+    console.log(`[search] index complete: ${indexed} new, ${skipped} unchanged, ${searchIndex.size} total`);
+  } catch (e: any) {
+    console.error(`[search] background indexing failed: ${e.message}`);
+    searchIndexReady = true; // mark ready even on failure so searches work with partial data
+  }
+}
+
+/** Incrementally update index for a session after a turn completes */
+function updateSearchIndexForSession(sessionId: string, userContent?: string, assistantContent?: string) {
+  const entry = searchIndex.get(sessionId);
+  const meta = sessionMeta.get(sessionId);
+  if (entry) {
+    if (userContent) {
+      entry.messages.push({ role: "user", content: userContent.substring(0, 2000) });
+    }
+    if (assistantContent) {
+      entry.messages.push({ role: "assistant", content: assistantContent.substring(0, 2000) });
+    }
+    entry.updatedAt = new Date().toISOString();
+    entry.title = meta?.name ?? entry.title;
+  } else {
+    // New session — create minimal entry, full index will catch up
+    searchIndex.set(sessionId, {
+      title: meta?.name ?? "Session",
+      model: meta?.model ?? "",
+      cwd: meta?.cwd ?? "",
+      updatedAt: new Date().toISOString(),
+      messages: [
+        ...(userContent ? [{ role: "user" as const, content: userContent.substring(0, 2000) }] : []),
+        ...(assistantContent ? [{ role: "assistant" as const, content: assistantContent.substring(0, 2000) }] : []),
+      ],
+    });
+  }
+  // Debounced save — don't write on every turn
+  scheduleIndexSave();
+}
+
+let indexSaveTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleIndexSave() {
+  if (indexSaveTimer) return;
+  indexSaveTimer = setTimeout(() => {
+    indexSaveTimer = null;
+    saveSearchIndex();
+  }, 10_000); // save at most every 10 seconds
+}
+
+/** Keyword search across the index */
+function keywordSearch(query: string, scope: "all" | "current", currentSessionId?: string): any[] {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return [];
+
+  const results: any[] = [];
+
+  for (const [sessionId, entry] of searchIndex) {
+    if (scope === "current" && sessionId !== currentSessionId) continue;
+
+    for (let i = 0; i < entry.messages.length; i++) {
+      const msg = entry.messages[i];
+      const lc = msg.content.toLowerCase();
+      if (terms.every(t => lc.includes(t))) {
+        // Build snippet around the first match
+        const firstTermIdx = Math.min(...terms.map(t => lc.indexOf(t)).filter(idx => idx >= 0));
+        const snippetStart = Math.max(0, firstTermIdx - 60);
+        const snippetEnd = Math.min(msg.content.length, firstTermIdx + 200);
+        const snippet = (snippetStart > 0 ? "…" : "") +
+          msg.content.substring(snippetStart, snippetEnd) +
+          (snippetEnd < msg.content.length ? "…" : "");
+
+        results.push({
+          sessionId,
+          title: entry.title,
+          model: entry.model,
+          role: msg.role,
+          messageIndex: i,
+          snippet,
+          timestamp: msg.timestamp,
+        });
+      }
+    }
+  }
+
+  // Sort by relevance (title matches first, then recency)
+  return results.slice(0, 50);
+}
+
+// Load existing index from disk on startup
+loadSearchIndex();
+
 // ── Auth config ──
 
 const AUTH_TENANT_ID = process.env.AUTH_TENANT_ID || "";
@@ -689,6 +913,105 @@ app.get("/api/snapshots", (_req, res) => {
 app.delete("/api/snapshots/:id", (req, res) => {
   if (deleteSnapshot(req.params.id)) res.json({ ok: true });
   else res.status(404).json({ error: "Snapshot not found" });
+});
+
+// ── Search API endpoints ──
+
+app.get("/api/search", (req, res) => {
+  const q = (req.query.q as string || "").trim();
+  const scope = (req.query.scope as string) === "current" ? "current" : "all";
+  const sessionId = req.query.sessionId as string | undefined;
+  if (!q) { res.json({ results: [] }); return; }
+  const results = keywordSearch(q, scope, sessionId);
+  res.json({ results, indexed: searchIndex.size, ready: searchIndexReady });
+});
+
+app.post("/api/search/ai", async (req, res) => {
+  const { query, scope, sessionId } = req.body;
+  if (!query?.trim()) { res.json({ results: [], answer: "" }); return; }
+
+  try {
+    await ensureClient();
+
+    // Build condensed context from index
+    const entries: string[] = [];
+    let totalChars = 0;
+    const MAX_CONTEXT = 80_000; // stay well within token limits
+
+    for (const [sid, entry] of searchIndex) {
+      if (scope === "current" && sid !== sessionId) continue;
+      // Condense each session to ~200 chars per message
+      const condensed = entry.messages.map(m =>
+        `[${m.role}] ${m.content.substring(0, 200)}`
+      ).join("\n");
+
+      const sessionBlock = `\n### Session: "${entry.title}" (id: ${sid})\n${condensed}\n`;
+      if (totalChars + sessionBlock.length > MAX_CONTEXT) break;
+      entries.push(sessionBlock);
+      totalChars += sessionBlock.length;
+    }
+
+    const systemPrompt = `You are a search assistant for a conversation history tool. The user wants to find relevant conversations from their past sessions.
+
+Below are condensed transcripts of their sessions. For each session, messages are prefixed with [user] or [assistant].
+
+${entries.join("\n")}
+
+Based on the user's query, return a JSON array of the most relevant sessions. Each result should have:
+- "sessionId": the session ID
+- "title": the session title
+- "relevance": a brief explanation of why this session is relevant
+- "snippet": a short excerpt from the most relevant message
+
+Return ONLY valid JSON, no other text. Example:
+[{"sessionId": "abc", "title": "My Chat", "relevance": "Discusses deployment", "snippet": "Let me deploy..."}]
+
+If no sessions match, return an empty array: []`;
+
+    // Use a one-shot session with a cheap model
+    const aiModel = availableModels.find(m => /haiku/i.test(m.id))?.id
+      ?? availableModels.find(m => /gpt-4.*mini/i.test(m.id))?.id
+      ?? availableModels.find(m => /sonnet/i.test(m.id))?.id
+      ?? defaultModel;
+
+    const aiSession = await copilot.createSession({
+      model: aiModel,
+      workingDirectory: DEFAULT_CWD,
+      onPermissionRequest: approveAll,
+      systemMessage: { mode: "replace" as const, content: systemPrompt },
+    });
+
+    const result = await aiSession.sendAndWait(
+      { prompt: `Search query: ${query}` },
+      60_000, // 1 minute timeout for AI search
+    );
+
+    const aiContent = (result?.data as any)?.content ?? "";
+    try { await aiSession.disconnect(); } catch {}
+
+    // Parse the AI response as JSON
+    let results: any[] = [];
+    try {
+      // Extract JSON from response (handle markdown code blocks)
+      const jsonMatch = aiContent.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        results = JSON.parse(jsonMatch[0]);
+      }
+    } catch {
+      // If parsing fails, return the raw response
+      res.json({ results: [], answer: aiContent, raw: true });
+      return;
+    }
+
+    res.json({ results, indexed: searchIndex.size });
+  } catch (e: any) {
+    console.error(`[search] AI search error: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/search/status", (_req, res) => {
+  res.json({ ready: searchIndexReady, indexed: searchIndex.size });
 });
 
 const server = http.createServer(app);
@@ -1258,6 +1581,9 @@ wss.on("connection", (ws: any) => {
             const resultData = result?.data as any;
             const content = resultData?.content ?? "";
             console.log(`[message] ← sendAndWait resolved, type: ${result?.type}, length: ${content.length}`);
+
+            // Incrementally update search index
+            updateSearchIndexForSession(msg.sessionId, msg.content, content);
 
             // Only broadcast from sendAndWait if the event listener didn't already handle this turn
             const eventsHandled = turnDeliveredByEvents.get(msg.sessionId) ?? false;
@@ -2038,11 +2364,15 @@ server.listen(PORT, "127.0.0.1", () => {
    For phone access, run in another terminal:
      devtunnel host
 `);
+
+  // Start background search indexing (non-blocking)
+  buildSearchIndex().catch(e => console.warn(`[search] background indexing error: ${e.message}`));
 });
 
 // Graceful shutdown
 process.on("SIGINT", async () => {
   console.log("\n[shutdown] cleaning up...");
+  saveSearchIndex();
   for (const [, session] of activeSessions) {
     try { await session.disconnect(); } catch {}
   }
