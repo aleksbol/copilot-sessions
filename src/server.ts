@@ -1252,7 +1252,7 @@ wss.on("connection", (ws: any) => {
           try {
             const result = await session.sendAndWait(
               { prompt },
-              600_000, // 10 minute timeout
+              3_600_000, // 1 hour timeout
             );
 
             const resultData = result?.data as any;
@@ -1328,7 +1328,7 @@ wss.on("connection", (ws: any) => {
                 try {
                   const contResult = await session.sendAndWait(
                     { prompt: LOOP_CONTINUATION },
-                    600_000,
+                    3_600_000,
                   );
                   const contData = contResult?.data as any;
                   lastContent = contData?.content ?? "";
@@ -1381,7 +1381,7 @@ wss.on("connection", (ws: any) => {
 
                 const retryResult = await reSession.sendAndWait(
                   { prompt },
-                  600_000,
+                  3_600_000,
                 );
                 const retryData = retryResult?.data as any;
                 const retryContent = retryData?.content ?? "";
@@ -1429,7 +1429,7 @@ wss.on("connection", (ws: any) => {
 
                     broadcast(msg.sessionId, { type: "user_message", sessionId: msg.sessionId, content: "[Loop continuation]" });
                     try {
-                      const contResult = await reSession.sendAndWait({ prompt: LOOP_CONTINUATION }, 600_000);
+                      const contResult = await reSession.sendAndWait({ prompt: LOOP_CONTINUATION }, 3_600_000);
                       const contData = contResult?.data as any;
                       lastContent = contData?.content ?? "";
                       const contEvH = turnDeliveredByEvents.get(msg.sessionId) ?? false;
