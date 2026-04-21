@@ -1,5 +1,5 @@
 import { CopilotClient, approveAll } from "@github/copilot-sdk";
-import type { CopilotSession, SessionEvent } from "@github/copilot-sdk";
+import type { CopilotSession, SessionEvent, Tool } from "@github/copilot-sdk";
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "node:http";
@@ -1298,6 +1298,229 @@ app.post("/api/scripts/runs/:id/kill", (req, res) => {
   }
 });
 
+// ── Agent Script Tools ──
+// These tools let Copilot agents manage and run canned scripts.
+// Use for well-known, long-running or repeated operations (e.g. deployments)
+// where both the agent and user need visibility into output.
+
+function getScriptTools(): Tool[] {
+  return [
+    {
+      name: "list_scripts",
+      description: "List all configured canned scripts. Use this to discover available scripts before running them. Canned scripts are for well-known, long-running or repeated operations (e.g. deployments) where both agent and user need visibility into output via the Scripts UI.",
+      parameters: { type: "object", properties: {}, required: [] },
+      skipPermission: true,
+      handler: async () => {
+        return JSON.stringify(scriptConfigs.map(s => ({
+          id: s.id, name: s.name, description: s.description,
+          path: s.path, args: s.args, cwd: s.cwd,
+        })));
+      },
+    },
+    {
+      name: "create_script",
+      description: "Create a new canned script configuration. Use for registering well-known, long-running operations (deployments, builds, etc.) that will be run repeatedly. The script will appear in the Scripts UI for the user to manage.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Human-readable name for the script" },
+          description: { type: "string", description: "What this script does" },
+          path: { type: "string", description: "Process/command to run (e.g. powershell, node, python)" },
+          args: { type: "array", items: { type: "string" }, description: "Command-line arguments" },
+          cwd: { type: "string", description: "Working directory for the process" },
+        },
+        required: ["name", "path"],
+      },
+      handler: async (args: any) => {
+        const config: ScriptConfig = {
+          id: crypto.randomBytes(8).toString("hex"),
+          name: args.name,
+          description: args.description || "",
+          path: args.path,
+          args: args.args || [],
+          cwd: args.cwd || DEFAULT_CWD,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        scriptConfigs.push(config);
+        saveScriptConfigs();
+        return JSON.stringify({ ok: true, script: config });
+      },
+    },
+    {
+      name: "update_script",
+      description: "Update an existing canned script configuration by ID.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Script ID to update" },
+          name: { type: "string", description: "New name" },
+          description: { type: "string", description: "New description" },
+          path: { type: "string", description: "New process path" },
+          args: { type: "array", items: { type: "string" }, description: "New arguments" },
+          cwd: { type: "string", description: "New working directory" },
+        },
+        required: ["id"],
+      },
+      handler: async (args: any) => {
+        const idx = scriptConfigs.findIndex(s => s.id === args.id);
+        if (idx === -1) return JSON.stringify({ error: "Script not found" });
+        if (args.name !== undefined) scriptConfigs[idx].name = args.name;
+        if (args.description !== undefined) scriptConfigs[idx].description = args.description;
+        if (args.path !== undefined) scriptConfigs[idx].path = args.path;
+        if (args.args !== undefined) scriptConfigs[idx].args = args.args;
+        if (args.cwd !== undefined) scriptConfigs[idx].cwd = args.cwd;
+        scriptConfigs[idx].updatedAt = new Date().toISOString();
+        saveScriptConfigs();
+        return JSON.stringify({ ok: true, script: scriptConfigs[idx] });
+      },
+    },
+    {
+      name: "delete_script",
+      description: "Delete a canned script configuration by ID.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Script ID to delete" },
+        },
+        required: ["id"],
+      },
+      handler: async (args: any) => {
+        const idx = scriptConfigs.findIndex(s => s.id === args.id);
+        if (idx === -1) return JSON.stringify({ error: "Script not found" });
+        scriptConfigs.splice(idx, 1);
+        saveScriptConfigs();
+        return JSON.stringify({ ok: true });
+      },
+    },
+    {
+      name: "run_script",
+      description: "Start a canned script by ID. Returns a run ID you can use with get_script_output to poll for output. The output is also visible in real-time in the Scripts UI. Use this for long-running operations where both you and the user need to monitor progress.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Script ID to run" },
+        },
+        required: ["id"],
+      },
+      handler: async (args: any) => {
+        const config = scriptConfigs.find(s => s.id === args.id);
+        if (!config) return JSON.stringify({ error: "Script not found" });
+
+        const runId = crypto.randomBytes(8).toString("hex");
+        const run: ScriptRun = {
+          id: runId,
+          scriptId: config.id,
+          scriptName: config.name,
+          status: "running",
+          output: [],
+          startedAt: new Date().toISOString(),
+        };
+        scriptRuns.set(runId, run);
+
+        const isWin = process.platform === "win32";
+        const shellCmd = isWin
+          ? `chcp 65001 >nul && ${config.path} ${config.args.map(a => a.includes(" ") ? `"${a}"` : a).join(" ")}`
+          : undefined;
+        const child = isWin
+          ? spawn(shellCmd!, [], { cwd: config.cwd || DEFAULT_CWD, shell: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env } })
+          : spawn(config.path, config.args, { cwd: config.cwd || DEFAULT_CWD, shell: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env } });
+        activeScriptProcesses.set(runId, child);
+        child.stdout?.setEncoding("utf8");
+        child.stderr?.setEncoding("utf8");
+
+        const appendOutput = (line: string) => {
+          run.output.push(line);
+          if (run.output.length > MAX_OUTPUT_LINES) run.output.splice(0, run.output.length - MAX_OUTPUT_LINES);
+          broadcastToAll({ type: "script_run_output", runId, line });
+        };
+
+        child.stdout?.on("data", (data: string) => {
+          for (const line of data.split("\n")) { if (line || data.split("\n").length === 1) appendOutput(line); }
+        });
+        child.stderr?.on("data", (data: string) => {
+          for (const line of data.split("\n")) { if (line || data.split("\n").length === 1) appendOutput(`[stderr] ${line}`); }
+        });
+        child.on("close", (code: number | null) => {
+          run.status = code === 0 ? "done" : "failed";
+          run.exitCode = code;
+          run.completedAt = new Date().toISOString();
+          activeScriptProcesses.delete(runId);
+          broadcastToAll({ type: "script_run_done", runId, status: run.status, exitCode: code });
+          saveScriptRuns();
+        });
+        child.on("error", (err: Error) => {
+          appendOutput(`[error] ${err.message}`);
+          run.status = "failed";
+          run.completedAt = new Date().toISOString();
+          activeScriptProcesses.delete(runId);
+          broadcastToAll({ type: "script_run_done", runId, status: "failed", exitCode: null });
+          saveScriptRuns();
+        });
+
+        broadcastToAll({ type: "script_run_started", run });
+        console.log(`[scripts] tool started run ${runId} for "${config.name}" (pid=${child.pid})`);
+        return JSON.stringify({ ok: true, runId, scriptName: config.name, status: "running" });
+      },
+    },
+    {
+      name: "get_script_output",
+      description: "Get the output and status of a script run. Use 'tail' to get only the last N lines (useful for polling long-running processes). Both agent and user see the same output in the Scripts UI.",
+      parameters: {
+        type: "object",
+        properties: {
+          runId: { type: "string", description: "The run ID returned by run_script" },
+          tail: { type: "number", description: "Return only the last N lines of output (default: all)" },
+        },
+        required: ["runId"],
+      },
+      skipPermission: true,
+      handler: async (args: any) => {
+        const run = scriptRuns.get(args.runId);
+        if (!run) return JSON.stringify({ error: "Run not found" });
+        const lines = args.tail ? run.output.slice(-args.tail) : run.output;
+        return JSON.stringify({
+          runId: run.id,
+          scriptName: run.scriptName,
+          status: run.status,
+          exitCode: run.exitCode ?? null,
+          startedAt: run.startedAt,
+          completedAt: run.completedAt ?? null,
+          totalLines: run.output.length,
+          output: lines,
+        });
+      },
+    },
+    {
+      name: "kill_script",
+      description: "Kill a running script process.",
+      parameters: {
+        type: "object",
+        properties: {
+          runId: { type: "string", description: "The run ID to kill" },
+        },
+        required: ["runId"],
+      },
+      handler: async (args: any) => {
+        const run = scriptRuns.get(args.runId);
+        if (!run) return JSON.stringify({ error: "Run not found" });
+        const child = activeScriptProcesses.get(args.runId);
+        if (!child) return JSON.stringify({ error: "Process not running" });
+        child.kill("SIGTERM");
+        if (process.platform === "win32" && child.pid) {
+          try { execSync(`taskkill /PID ${child.pid} /T /F`, { stdio: "ignore" }); } catch {}
+        }
+        run.status = "killed";
+        run.completedAt = new Date().toISOString();
+        activeScriptProcesses.delete(args.runId);
+        broadcastToAll({ type: "script_run_done", runId: args.runId, status: "killed", exitCode: null });
+        saveScriptRuns();
+        return JSON.stringify({ ok: true, status: "killed" });
+      },
+    },
+  ];
+}
+
 const server = http.createServer(app);
 
 // ── WebSocket server (with auth gate on upgrade) ──
@@ -1783,6 +2006,7 @@ wss.on("connection", (ws: any) => {
             onPermissionRequest: approveAll,
             onUserInputRequest: createUserInputHandler(msg.sessionId || "pending"),
             onElicitationRequest: createElicitationHandler(msg.sessionId || "pending"),
+            tools: getScriptTools(),
             ...(mcpServers ? { mcpServers } : {}),
             ...(msg.reasoningEffort ? { reasoningEffort: msg.reasoningEffort } : {}),
             ...(systemMessage ? { systemMessage: { mode: "append" as const, content: systemMessage } } : {}),
@@ -1983,6 +2207,7 @@ wss.on("connection", (ws: any) => {
                   onPermissionRequest: approveAll,
                   onUserInputRequest: createUserInputHandler(msg.sessionId),
                   onElicitationRequest: createElicitationHandler(msg.sessionId),
+                  tools: getScriptTools(),
                   ...(mcpServers ? { mcpServers } : {}),
                 });
                 activeSessions.set(msg.sessionId, reSession);
@@ -2146,6 +2371,7 @@ wss.on("connection", (ws: any) => {
                 onPermissionRequest: approveAll,
                 onUserInputRequest: createUserInputHandler(sessionId),
                 onElicitationRequest: createElicitationHandler(sessionId),
+                tools: getScriptTools(),
                 ...(mcpServers ? { mcpServers } : {}),
               });
             } catch (resumeErr: any) {
@@ -2211,6 +2437,7 @@ wss.on("connection", (ws: any) => {
                         onPermissionRequest: approveAll,
                         onUserInputRequest: createUserInputHandler(sessionId),
                         onElicitationRequest: createElicitationHandler(sessionId),
+                        tools: getScriptTools(),
                         ...(mcpServers ? { mcpServers } : {}),
                       });
                       activeSessions.set(sessionId, reSession);
