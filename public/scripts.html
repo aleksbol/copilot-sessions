@@ -11,7 +11,7 @@
 </head>
 <body class="scripts-body">
   <!-- Sidebar: script list -->
-  <aside class="scripts-sidebar">
+  <aside id="scripts-sidebar" class="scripts-sidebar">
     <div class="scripts-sidebar-header">
       <h2>Scripts</h2>
       <div class="scripts-sidebar-actions">
@@ -22,10 +22,14 @@
     <div id="script-list" class="script-list"></div>
   </aside>
 
+  <!-- Sidebar overlay for mobile -->
+  <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
   <!-- Main area -->
   <main class="scripts-main">
     <!-- Empty state -->
     <div id="scripts-empty" class="scripts-empty">
+      <button id="empty-menu-btn" class="btn-icon menu-btn" title="Scripts" style="position:absolute;top:12px;left:12px;">☰</button>
       <div class="scripts-empty-icon">▶</div>
       <h2>Canned Scripts</h2>
       <p>Configure reusable scripts and processes to run on demand. Monitor output in real time.</p>
@@ -35,6 +39,7 @@
     <!-- Script detail view -->
     <div id="script-detail" class="script-detail" style="display:none">
       <header class="script-detail-header">
+        <button id="menu-btn" class="btn-icon menu-btn" title="Scripts">☰</button>
         <div class="script-detail-info">
           <h2 id="detail-name"></h2>
           <span id="detail-description" class="detail-description"></span>

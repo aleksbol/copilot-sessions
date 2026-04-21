@@ -412,6 +412,20 @@
 
 /* ── Mobile responsive ── */
 
+.menu-btn {
+  display: none;
+  font-size: 20px;
+  margin-right: 8px;
+}
+
+.sidebar-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 99;
+}
+
 @media (max-width: 768px) {
   .scripts-sidebar {
     position: fixed;
@@ -425,9 +439,31 @@
   .scripts-sidebar.open {
     transform: translateX(0);
   }
+  .scripts-sidebar.open ~ .sidebar-overlay {
+    display: block;
+  }
+  .menu-btn {
+    display: inline-flex;
+  }
   .dialog {
     min-width: unset;
     max-width: 90vw;
     width: 90vw;
+  }
+  .script-detail-header {
+    padding: 10px 12px;
+  }
+  .script-config-bar {
+    padding: 6px 12px;
+    flex-wrap: wrap;
+  }
+  .run-history {
+    padding: 6px 12px;
+  }
+  .output-header {
+    padding: 6px 12px;
+  }
+  .output-log {
+    padding: 8px 12px;
   }
 }

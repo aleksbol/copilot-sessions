@@ -141,11 +141,13 @@
   function selectScript(id) {
     selectedScriptId = id;
     const scriptRuns = runs.filter(r => r.scriptId === id).sort((a, b) => b.startedAt.localeCompare(a.startedAt));
-    // Auto-select latest run if any
     selectedRunId = scriptRuns.length > 0 ? scriptRuns[0].id : null;
     renderScriptList();
     renderDetail();
     updateEmptyState();
+    // Close sidebar on mobile after selection
+    const sb = document.getElementById("scripts-sidebar");
+    if (sb) sb.classList.remove("open");
   }
 
   function renderDetail() {
@@ -357,6 +359,18 @@
   }
 
   // ── Event bindings ──
+  const sidebar = document.getElementById("scripts-sidebar");
+  const sidebarOverlay = document.getElementById("sidebar-overlay");
+  const menuBtn = document.getElementById("menu-btn");
+
+  function openSidebar() { sidebar.classList.add("open"); }
+  function closeSidebar() { sidebar.classList.remove("open"); }
+
+  menuBtn.onclick = openSidebar;
+  const emptyMenuBtn = document.getElementById("empty-menu-btn");
+  emptyMenuBtn.onclick = openSidebar;
+  sidebarOverlay.onclick = closeSidebar;
+
   addScriptBtn.onclick = () => openScriptDialog(null);
   emptyAddBtn.onclick = () => openScriptDialog(null);
   editScriptBtn.onclick = () => openScriptDialog(selectedScriptId);
