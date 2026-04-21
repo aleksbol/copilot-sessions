@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>Scripts — Copilot Sessions</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/scripts.css" />
+</head>
+<body class="scripts-body">
+  <!-- Sidebar: script list -->
+  <aside class="scripts-sidebar">
+    <div class="scripts-sidebar-header">
+      <h2>Scripts</h2>
+      <div class="scripts-sidebar-actions">
+        <button id="add-script-btn" class="btn-icon" title="Add script">＋</button>
+        <a href="/" class="btn-icon" title="Back to Sessions">💬</a>
+      </div>
+    </div>
+    <div id="script-list" class="script-list"></div>
+  </aside>
+
+  <!-- Main area -->
+  <main class="scripts-main">
+    <!-- Empty state -->
+    <div id="scripts-empty" class="scripts-empty">
+      <div class="scripts-empty-icon">▶</div>
+      <h2>Canned Scripts</h2>
+      <p>Configure reusable scripts and processes to run on demand. Monitor output in real time.</p>
+      <button id="empty-add-btn" class="dialog-btn dialog-btn-primary">＋ Add Script</button>
+    </div>
+
+    <!-- Script detail view -->
+    <div id="script-detail" class="script-detail" style="display:none">
+      <header class="script-detail-header">
+        <div class="script-detail-info">
+          <h2 id="detail-name"></h2>
+          <span id="detail-description" class="detail-description"></span>
+        </div>
+        <div class="script-detail-actions">
+          <button id="run-script-btn" class="dialog-btn dialog-btn-primary" title="Run script">▶ Run</button>
+          <button id="edit-script-btn" class="btn-icon" title="Edit script">✎</button>
+          <button id="delete-script-btn" class="btn-icon danger-icon" title="Delete script">🗑</button>
+        </div>
+      </header>
+      <div class="script-config-bar">
+        <code id="detail-command"></code>
+        <span class="detail-cwd" id="detail-cwd"></span>
+      </div>
+      <!-- Run history -->
+      <div id="run-history" class="run-history"></div>
+      <!-- Output viewer -->
+      <div id="output-viewer" class="output-viewer">
+        <div class="output-header">
+          <span id="output-title">Output</span>
+          <button id="kill-btn" class="dialog-btn dialog-btn-danger" style="display:none">⬛ Kill</button>
+        </div>
+        <pre id="output-log" class="output-log"></pre>
+      </div>
+    </div>
+  </main>
+
+  <!-- Add/Edit Script Dialog -->
+  <div id="script-dialog" class="dialog-overlay" style="display:none">
+    <div class="dialog">
+      <h3 id="script-dialog-title">Add Script</h3>
+      <div class="dialog-field">
+        <label for="script-name">Name</label>
+        <input id="script-name" type="text" placeholder="e.g. Deploy API" />
+      </div>
+      <div class="dialog-field">
+        <label for="script-description">Description (optional)</label>
+        <input id="script-description" type="text" placeholder="e.g. Build and deploy the API service" />
+      </div>
+      <div class="dialog-field">
+        <label for="script-path">Process Path</label>
+        <input id="script-path" type="text" placeholder="e.g. powershell, node, python" />
+      </div>
+      <div class="dialog-field">
+        <label for="script-args">Arguments (one per line)</label>
+        <textarea id="script-args" rows="3" placeholder="e.g. -File&#10;deploy.ps1&#10;--env=prod"></textarea>
+      </div>
+      <div class="dialog-field">
+        <label for="script-cwd">Working Directory</label>
+        <input id="script-cwd" type="text" placeholder="e.g. C:\repos\my-api" />
+      </div>
+      <div class="dialog-actions">
+        <button id="script-dialog-cancel" class="dialog-btn dialog-btn-secondary">Cancel</button>
+        <button id="script-dialog-save" class="dialog-btn dialog-btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/scripts.js"></script>
+</body>
+</html>

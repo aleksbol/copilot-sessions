@@ -6,7 +6,7 @@ import http from "node:http";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { execSync } from "node:child_process";
+import { execSync, spawn, ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import { parse as parseCookie, serialize as serializeCookie } from "cookie";
@@ -916,6 +916,11 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname, "..", "public")));
 
+// Route /scripts to scripts.html
+app.get("/scripts", (_req, res) => {
+  res.sendFile(path.join(__dirname, "..", "public", "scripts.html"));
+});
+
 // API endpoint: list available models
 app.get("/api/models", async (_req, res) => {
   try {
@@ -1033,6 +1038,252 @@ If no sessions match, return an empty array: []`;
 
 app.get("/api/search/status", (_req, res) => {
   res.json({ ready: searchIndexReady, indexed: searchIndex.size });
+});
+
+// ── Canned Scripts ──
+
+interface ScriptConfig {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  args: string[];
+  cwd: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ScriptRun {
+  id: string;
+  scriptId: string;
+  scriptName: string;
+  status: "running" | "done" | "failed" | "killed";
+  output: string[];
+  startedAt: string;
+  completedAt?: string;
+  exitCode?: number | null;
+}
+
+const SCRIPTS_CONFIG_FILE = path.join(process.env.USERPROFILE || process.env.HOME || "", ".copilot", "scripts.json");
+const SCRIPT_RUNS_FILE = path.join(process.env.USERPROFILE || process.env.HOME || "", ".copilot", "script-runs.json");
+const MAX_RUNS_PER_SCRIPT = 20;
+const MAX_OUTPUT_LINES = 5000;
+
+let scriptConfigs: ScriptConfig[] = [];
+const scriptRuns = new Map<string, ScriptRun>(); // runId → run
+const activeScriptProcesses = new Map<string, ChildProcess>(); // runId → child process
+
+function loadScriptConfigs() {
+  try {
+    if (fs.existsSync(SCRIPTS_CONFIG_FILE)) {
+      scriptConfigs = JSON.parse(fs.readFileSync(SCRIPTS_CONFIG_FILE, "utf-8"));
+      console.log(`[scripts] loaded ${scriptConfigs.length} script config(s)`);
+    }
+  } catch (e: any) {
+    console.warn(`[scripts] failed to load configs: ${e.message}`);
+  }
+}
+
+function saveScriptConfigs() {
+  try {
+    const dir = path.dirname(SCRIPTS_CONFIG_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(SCRIPTS_CONFIG_FILE, JSON.stringify(scriptConfigs, null, 2));
+  } catch (e: any) {
+    console.warn(`[scripts] failed to save configs: ${e.message}`);
+  }
+}
+
+function loadScriptRuns() {
+  try {
+    if (fs.existsSync(SCRIPT_RUNS_FILE)) {
+      const data: ScriptRun[] = JSON.parse(fs.readFileSync(SCRIPT_RUNS_FILE, "utf-8"));
+      for (const run of data) {
+        // Don't restore "running" status — process is gone after restart
+        if (run.status === "running") run.status = "failed";
+        scriptRuns.set(run.id, run);
+      }
+      console.log(`[scripts] loaded ${scriptRuns.size} run(s) from history`);
+    }
+  } catch (e: any) {
+    console.warn(`[scripts] failed to load runs: ${e.message}`);
+  }
+}
+
+function saveScriptRuns() {
+  try {
+    const dir = path.dirname(SCRIPT_RUNS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // Keep only last N runs per script
+    const byScript = new Map<string, ScriptRun[]>();
+    for (const run of scriptRuns.values()) {
+      const arr = byScript.get(run.scriptId) ?? [];
+      arr.push(run);
+      byScript.set(run.scriptId, arr);
+    }
+    const kept: ScriptRun[] = [];
+    for (const [, runs] of byScript) {
+      runs.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+      kept.push(...runs.slice(0, MAX_RUNS_PER_SCRIPT));
+    }
+    fs.writeFileSync(SCRIPT_RUNS_FILE, JSON.stringify(kept));
+  } catch (e: any) {
+    console.warn(`[scripts] failed to save runs: ${e.message}`);
+  }
+}
+
+loadScriptConfigs();
+loadScriptRuns();
+
+// REST API: Script configs
+app.get("/api/scripts", (_req, res) => {
+  res.json(scriptConfigs);
+});
+
+app.post("/api/scripts", (req, res) => {
+  const { name, description, path: scriptPath, args, cwd } = req.body;
+  if (!name || !scriptPath) { res.status(400).json({ error: "name and path are required" }); return; }
+  const config: ScriptConfig = {
+    id: crypto.randomBytes(8).toString("hex"),
+    name,
+    description: description || "",
+    path: scriptPath,
+    args: args || [],
+    cwd: cwd || DEFAULT_CWD,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  scriptConfigs.push(config);
+  saveScriptConfigs();
+  res.json(config);
+});
+
+app.put("/api/scripts/:id", (req, res) => {
+  const idx = scriptConfigs.findIndex(s => s.id === req.params.id);
+  if (idx === -1) { res.status(404).json({ error: "Script not found" }); return; }
+  const { name, description, path: scriptPath, args, cwd } = req.body;
+  if (name !== undefined) scriptConfigs[idx].name = name;
+  if (description !== undefined) scriptConfigs[idx].description = description;
+  if (scriptPath !== undefined) scriptConfigs[idx].path = scriptPath;
+  if (args !== undefined) scriptConfigs[idx].args = args;
+  if (cwd !== undefined) scriptConfigs[idx].cwd = cwd;
+  scriptConfigs[idx].updatedAt = new Date().toISOString();
+  saveScriptConfigs();
+  res.json(scriptConfigs[idx]);
+});
+
+app.delete("/api/scripts/:id", (req, res) => {
+  const idx = scriptConfigs.findIndex(s => s.id === req.params.id);
+  if (idx === -1) { res.status(404).json({ error: "Script not found" }); return; }
+  scriptConfigs.splice(idx, 1);
+  saveScriptConfigs();
+  res.json({ ok: true });
+});
+
+// REST API: Script runs
+app.get("/api/scripts/runs", (_req, res) => {
+  const runs = [...scriptRuns.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  res.json(runs);
+});
+
+app.get("/api/scripts/runs/:id", (req, res) => {
+  const run = scriptRuns.get(req.params.id);
+  if (!run) { res.status(404).json({ error: "Run not found" }); return; }
+  res.json(run);
+});
+
+// Start a script run
+app.post("/api/scripts/:id/run", (req, res) => {
+  const config = scriptConfigs.find(s => s.id === req.params.id);
+  if (!config) { res.status(404).json({ error: "Script not found" }); return; }
+
+  const runId = crypto.randomBytes(8).toString("hex");
+  const run: ScriptRun = {
+    id: runId,
+    scriptId: config.id,
+    scriptName: config.name,
+    status: "running",
+    output: [],
+    startedAt: new Date().toISOString(),
+  };
+  scriptRuns.set(runId, run);
+
+  // Spawn the process
+  const child = spawn(config.path, config.args, {
+    cwd: config.cwd || DEFAULT_CWD,
+    shell: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env },
+  });
+  activeScriptProcesses.set(runId, child);
+
+  const appendOutput = (line: string) => {
+    run.output.push(line);
+    if (run.output.length > MAX_OUTPUT_LINES) {
+      run.output.splice(0, run.output.length - MAX_OUTPUT_LINES);
+    }
+    broadcastToAll({ type: "script_run_output", runId, line });
+  };
+
+  child.stdout?.on("data", (data: Buffer) => {
+    const lines = data.toString().split("\n");
+    for (const line of lines) {
+      if (line || lines.length === 1) appendOutput(line);
+    }
+  });
+
+  child.stderr?.on("data", (data: Buffer) => {
+    const lines = data.toString().split("\n");
+    for (const line of lines) {
+      if (line || lines.length === 1) appendOutput(`[stderr] ${line}`);
+    }
+  });
+
+  child.on("close", (code: number | null) => {
+    run.status = code === 0 ? "done" : "failed";
+    run.exitCode = code;
+    run.completedAt = new Date().toISOString();
+    activeScriptProcesses.delete(runId);
+    broadcastToAll({ type: "script_run_done", runId, status: run.status, exitCode: code });
+    saveScriptRuns();
+    console.log(`[scripts] run ${runId} completed: exit=${code}`);
+  });
+
+  child.on("error", (err: Error) => {
+    appendOutput(`[error] ${err.message}`);
+    run.status = "failed";
+    run.completedAt = new Date().toISOString();
+    activeScriptProcesses.delete(runId);
+    broadcastToAll({ type: "script_run_done", runId, status: "failed", exitCode: null });
+    saveScriptRuns();
+  });
+
+  console.log(`[scripts] started run ${runId} for "${config.name}" (pid=${child.pid})`);
+  broadcastToAll({ type: "script_run_started", run });
+  res.json(run);
+});
+
+// Kill a running script
+app.post("/api/scripts/runs/:id/kill", (req, res) => {
+  const run = scriptRuns.get(req.params.id);
+  if (!run) { res.status(404).json({ error: "Run not found" }); return; }
+  const child = activeScriptProcesses.get(req.params.id);
+  if (!child) { res.status(400).json({ error: "Process not running" }); return; }
+  try {
+    child.kill("SIGTERM");
+    // On Windows, SIGTERM may not work — use taskkill
+    if (process.platform === "win32" && child.pid) {
+      try { execSync(`taskkill /PID ${child.pid} /T /F`, { stdio: "ignore" }); } catch {}
+    }
+    run.status = "killed";
+    run.completedAt = new Date().toISOString();
+    activeScriptProcesses.delete(req.params.id);
+    broadcastToAll({ type: "script_run_done", runId: req.params.id, status: "killed", exitCode: null });
+    saveScriptRuns();
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 const server = http.createServer(app);
@@ -2439,6 +2690,7 @@ server.listen(PORT, "127.0.0.1", () => {
 process.on("SIGINT", async () => {
   console.log("\n[shutdown] cleaning up...");
   saveSearchIndex();
+  saveScriptRuns();
   for (const [, session] of activeSessions) {
     try { await session.disconnect(); } catch {}
   }
