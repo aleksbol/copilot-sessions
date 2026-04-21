@@ -1208,15 +1208,27 @@ app.post("/api/scripts/:id/run", (req, res) => {
   };
   scriptRuns.set(runId, run);
 
-  // Spawn the process
-  const child = spawn(config.path, config.args, {
-    cwd: config.cwd || DEFAULT_CWD,
-    shell: true,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env },
-  });
+  // Spawn the process — force UTF-8 on Windows (chcp 65001)
+  const isWin = process.platform === "win32";
+  const shellCmd = isWin
+    ? `chcp 65001 >nul && ${config.path} ${config.args.map(a => a.includes(" ") ? `"${a}"` : a).join(" ")}`
+    : undefined;
+  const child = isWin
+    ? spawn(shellCmd!, [], {
+        cwd: config.cwd || DEFAULT_CWD,
+        shell: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env },
+      })
+    : spawn(config.path, config.args, {
+        cwd: config.cwd || DEFAULT_CWD,
+        shell: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env },
+      });
   activeScriptProcesses.set(runId, child);
-
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
   const appendOutput = (line: string) => {
     run.output.push(line);
     if (run.output.length > MAX_OUTPUT_LINES) {
@@ -1225,15 +1237,15 @@ app.post("/api/scripts/:id/run", (req, res) => {
     broadcastToAll({ type: "script_run_output", runId, line });
   };
 
-  child.stdout?.on("data", (data: Buffer) => {
-    const lines = data.toString().split("\n");
+  child.stdout?.on("data", (data: string) => {
+    const lines = data.split("\n");
     for (const line of lines) {
       if (line || lines.length === 1) appendOutput(line);
     }
   });
 
-  child.stderr?.on("data", (data: Buffer) => {
-    const lines = data.toString().split("\n");
+  child.stderr?.on("data", (data: string) => {
+    const lines = data.split("\n");
     for (const line of lines) {
       if (line || lines.length === 1) appendOutput(`[stderr] ${line}`);
     }
