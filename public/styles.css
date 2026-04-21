@@ -635,6 +635,14 @@ body {
   text-align: right;
 }
 
+.load-more-indicator {
+  text-align: center;
+  padding: 12px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  cursor: default;
+}
+
 .message-user .message-bubble {
   background: var(--bg-user-msg);
   border-radius: 12px 12px 2px 12px;

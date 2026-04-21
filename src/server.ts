@@ -629,6 +629,10 @@ const turnDeliveredByEvents = new Map<string, boolean>();
 const EVENT_BUFFER_SIZE = 500;
 const sessionEventBuffers = new Map<string, any[]>();
 
+// Full message history cache for pagination (sessionId → history array)
+const HISTORY_PAGE_SIZE = 100;
+const sessionHistoryCache = new Map<string, any[]>();
+
 function appendToEventBuffer(sessionId: string, event: Record<string, unknown>) {
   let buf = sessionEventBuffers.get(sessionId);
   if (!buf) {
@@ -1923,7 +1927,10 @@ wss.on("connection", (ws: any) => {
                 try {
                   const events = await session!.getMessages();
                   const history = eventsToHistory(events);
-                  send(ws, { type: "session_history", sessionId, messages: history });
+                  sessionHistoryCache.set(sessionId, history);
+                  const page = history.slice(-HISTORY_PAGE_SIZE);
+                  const hasMore = history.length > HISTORY_PAGE_SIZE;
+                  send(ws, { type: "session_history", sessionId, messages: page, hasMore, totalMessages: history.length });
                   seedBufferFromHistory(sessionId, history);
                   indexFromHistory(history);
                   return true;
@@ -1948,7 +1955,10 @@ wss.on("connection", (ws: any) => {
                       bindSessionEvents(reSession, sessionId);
                       const events2 = await reSession.getMessages();
                       const history2 = eventsToHistory(events2);
-                      send(ws, { type: "session_history", sessionId, messages: history2 });
+                      sessionHistoryCache.set(sessionId, history2);
+                      const page2 = history2.slice(-HISTORY_PAGE_SIZE);
+                      const hasMore2 = history2.length > HISTORY_PAGE_SIZE;
+                      send(ws, { type: "session_history", sessionId, messages: page2, hasMore: hasMore2, totalMessages: history2.length });
                       seedBufferFromHistory(sessionId, history2);
                       indexFromHistory(history2);
                       console.log(`[session] history fetched after fresh re-resume`);
@@ -1972,7 +1982,9 @@ wss.on("connection", (ws: any) => {
               const buf = sessionEventBuffers.get(sessionId)!;
               console.log(`[session] falling back to buffer replay: ${buf.length} event(s) for ${sessionId.substring(0, 8)}`);
               const history = bufferToHistory(buf);
-              send(ws, { type: "session_history", sessionId, messages: history });
+              sessionHistoryCache.set(sessionId, history);
+              const page = history.slice(-HISTORY_PAGE_SIZE);
+              send(ws, { type: "session_history", sessionId, messages: page, hasMore: history.length > HISTORY_PAGE_SIZE, totalMessages: history.length });
             } else if (!gotHistory) {
               send(ws, { type: "session_history", sessionId, messages: [] });
             }
@@ -1998,6 +2010,24 @@ wss.on("connection", (ws: any) => {
           break;
         }
 
+        // ── Load more history (pagination) ──
+        case "load_more_history": {
+          const sessionId = msg.sessionId;
+          const before = msg.before ?? 0; // number of messages already loaded by client
+          const cached = sessionHistoryCache.get(sessionId);
+          if (!cached || cached.length === 0) {
+            send(ws, { type: "more_history", sessionId, messages: [], hasMore: false });
+            break;
+          }
+          // Client has the last `before` messages; send the preceding page
+          const endIdx = Math.max(0, cached.length - before);
+          const startIdx = Math.max(0, endIdx - HISTORY_PAGE_SIZE);
+          const page = cached.slice(startIdx, endIdx);
+          const hasMore = startIdx > 0;
+          send(ws, { type: "more_history", sessionId, messages: page, hasMore });
+          break;
+        }
+
         // ── Delete session ──
         case "delete_session": {
           const sessionId = msg.sessionId;
@@ -2008,6 +2038,7 @@ wss.on("connection", (ws: any) => {
           }
           boundSessionIds.delete(sessionId);
           sessionEventBuffers.delete(sessionId);
+          sessionHistoryCache.delete(sessionId);
           turnDeliveredByEvents.delete(sessionId);
           try {
             await copilot.deleteSession(sessionId);

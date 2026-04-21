@@ -26,6 +26,9 @@
   const loopingSessions = new Set(); // sessionIds with active loops
   let menuHideTimer = null;
   let notificationsEnabled = localStorage.getItem("notificationsEnabled") !== "false"; // default on
+  let historyHasMore = false; // whether older messages are available
+  let historyLoadedCount = 0; // how many messages currently loaded
+  let loadingMoreHistory = false; // prevent concurrent requests
 
   // ── DOM refs ──
 
@@ -705,6 +708,10 @@
         if (msg.sessionId === currentSessionId) {
           clearMessages();
           renderHistory(msg.messages || []);
+          historyHasMore = !!msg.hasMore;
+          historyLoadedCount = (msg.messages || []).length;
+          loadingMoreHistory = false;
+          if (historyHasMore) showLoadMoreIndicator();
           // History received means the session is idle — always clear streaming state
           streamingSessionIds.delete(msg.sessionId);
           isStreaming = false;
@@ -712,6 +719,21 @@
           streamingBuffer = "";
           hideThinkingIndicator();
           updateSendState();
+        }
+        break;
+
+      case "more_history":
+        if (msg.sessionId === currentSessionId && msg.messages?.length) {
+          prependHistory(msg.messages);
+          historyLoadedCount += msg.messages.length;
+          historyHasMore = !!msg.hasMore;
+          loadingMoreHistory = false;
+          if (historyHasMore) showLoadMoreIndicator();
+          else hideLoadMoreIndicator();
+        } else {
+          loadingMoreHistory = false;
+          historyHasMore = false;
+          hideLoadMoreIndicator();
         }
         break;
 
@@ -1116,6 +1138,9 @@
 
   function clearMessages() {
     messagesEl.innerHTML = "";
+    historyHasMore = false;
+    historyLoadedCount = 0;
+    loadingMoreHistory = false;
   }
 
   function renderHistory(messages) {
@@ -1155,6 +1180,127 @@
 
     scrollToBottom();
   }
+
+  /** Render older messages at the top, preserving scroll position */
+  function prependHistory(messages) {
+    const prevScrollHeight = messagesEl.scrollHeight;
+    const prevScrollTop = messagesEl.scrollTop;
+
+    // Build a document fragment with the older messages
+    const frag = document.createDocumentFragment();
+    const answeredCallIds = new Set();
+    for (const m of messages) {
+      if (m.role === "tool_result") answeredCallIds.add(m.parentId || m.callId);
+    }
+
+    let lastRole = null;
+    for (const msg of messages) {
+      let el = null;
+      switch (msg.role) {
+        case "user":
+          el = createUserMessageEl(msg.content, msg.timestamp);
+          break;
+        case "assistant":
+          if (msg.content) {
+            const showTs = lastRole !== "assistant";
+            el = createAssistantMessageEl(msg.content, showTs ? msg.timestamp : null);
+          }
+          break;
+        case "tool_call": {
+          const toolName = (msg.name || "").toLowerCase().replace(/[^a-z0-9_]/g, "_");
+          if (toolName === "ask_user" && !answeredCallIds.has(msg.callId)) break;
+          el = createToolStartEl(msg.name, msg.args, msg.callId, msg.intention);
+          break;
+        }
+        case "tool_result":
+          break;
+      }
+      if (el) frag.appendChild(el);
+      lastRole = msg.role;
+    }
+
+    hideLoadMoreIndicator();
+    const firstChild = messagesEl.firstChild;
+    messagesEl.insertBefore(frag, firstChild);
+
+    // Restore scroll position so it doesn't jump
+    const newScrollHeight = messagesEl.scrollHeight;
+    messagesEl.scrollTop = prevScrollTop + (newScrollHeight - prevScrollHeight);
+  }
+
+  function createUserMessageEl(text, timestamp) {
+    const div = document.createElement("div");
+    div.className = "message message-user";
+    const bubble = document.createElement("div");
+    bubble.className = "message-bubble";
+    bubble.innerHTML = renderMarkdown(text);
+    div.appendChild(bubble);
+    const ts = document.createElement("span");
+    ts.className = "message-timestamp";
+    ts.textContent = formatTimestamp(timestamp);
+    div.appendChild(ts);
+    return div;
+  }
+
+  function createAssistantMessageEl(markdown, timestamp) {
+    const div = document.createElement("div");
+    div.className = "message message-assistant";
+    if (timestamp) {
+      const ts = document.createElement("span");
+      ts.className = "message-timestamp";
+      ts.textContent = formatTimestamp(timestamp);
+      div.appendChild(ts);
+    }
+    const bubble = document.createElement("div");
+    bubble.className = "message-bubble";
+    bubble.innerHTML = renderMarkdown(markdown);
+    div.appendChild(bubble);
+    highlightRenderedCode(bubble);
+    addCopyButtons(bubble);
+    return div;
+  }
+
+  function createToolStartEl(name, args, callId, intention) {
+    const div = document.createElement("div");
+    div.className = "tool-call";
+    div.dataset.callId = callId || "";
+    const header = document.createElement("div");
+    header.className = "tool-call-header";
+    header.innerHTML = `<span class="tool-icon">⚙️</span> <strong>${escapeHtml(name || "tool")}</strong>`;
+    if (intention) {
+      const intentEl = document.createElement("span");
+      intentEl.className = "tool-intention";
+      intentEl.textContent = ` — ${intention}`;
+      header.appendChild(intentEl);
+    }
+    div.appendChild(header);
+    return div;
+  }
+
+  function showLoadMoreIndicator() {
+    hideLoadMoreIndicator();
+    const el = document.createElement("div");
+    el.id = "load-more-indicator";
+    el.className = "load-more-indicator";
+    el.textContent = "↑ Scroll up for older messages";
+    messagesEl.insertBefore(el, messagesEl.firstChild);
+  }
+
+  function hideLoadMoreIndicator() {
+    const el = document.getElementById("load-more-indicator");
+    if (el) el.remove();
+  }
+
+  // Scroll-to-top triggers loading more history
+  messagesEl.addEventListener("scroll", () => {
+    if (!historyHasMore || loadingMoreHistory) return;
+    if (messagesEl.scrollTop < 80) {
+      loadingMoreHistory = true;
+      const indicator = document.getElementById("load-more-indicator");
+      if (indicator) indicator.textContent = "Loading…";
+      wsSend({ type: "load_more_history", sessionId: currentSessionId, before: historyLoadedCount });
+    }
+  });
 
   function formatTimestamp(ts) {
     const d = ts ? new Date(ts) : new Date();
