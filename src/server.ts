@@ -1058,20 +1058,25 @@ interface ScriptRun {
   scriptId: string;
   scriptName: string;
   status: "running" | "done" | "failed" | "killed";
-  output: string[];
   startedAt: string;
   completedAt?: string;
   exitCode?: number | null;
+  outputLines: number; // total line count (kept in sync)
 }
 
 const SCRIPTS_CONFIG_FILE = path.join(process.env.USERPROFILE || process.env.HOME || "", ".copilot", "scripts.json");
 const SCRIPT_RUNS_FILE = path.join(process.env.USERPROFILE || process.env.HOME || "", ".copilot", "script-runs.json");
+const SCRIPT_RUNS_DIR = path.join(process.env.USERPROFILE || process.env.HOME || "", ".copilot", "script-runs");
 const MAX_RUNS_PER_SCRIPT = 20;
-const MAX_OUTPUT_LINES = 5000;
+const OUTPUT_FLUSH_INTERVAL_MS = 3000;
+const OUTPUT_PAGE_BYTES = 64 * 1024; // 64KB per page
 
 let scriptConfigs: ScriptConfig[] = [];
-const scriptRuns = new Map<string, ScriptRun>(); // runId → run
+const scriptRuns = new Map<string, ScriptRun>(); // runId → run metadata
 const activeScriptProcesses = new Map<string, ChildProcess>(); // runId → child process
+// In-memory output buffer for running processes (flushed to disk periodically)
+const runOutputBuffers = new Map<string, string[]>(); // runId → unflushed lines
+const runFlushTimers = new Map<string, ReturnType<typeof setInterval>>();
 
 function loadScriptConfigs() {
   try {
@@ -1092,6 +1097,63 @@ function saveScriptConfigs() {
   } catch (e: any) {
     console.warn(`[scripts] failed to save configs: ${e.message}`);
   }
+}
+
+function getRunOutputPath(runId: string): string {
+  return path.join(SCRIPT_RUNS_DIR, `${runId}.log`);
+}
+
+function ensureRunsDir() {
+  if (!fs.existsSync(SCRIPT_RUNS_DIR)) fs.mkdirSync(SCRIPT_RUNS_DIR, { recursive: true });
+}
+
+function flushOutputBuffer(runId: string) {
+  const buf = runOutputBuffers.get(runId);
+  if (!buf || buf.length === 0) return;
+  try {
+    ensureRunsDir();
+    fs.appendFileSync(getRunOutputPath(runId), buf.join("\n") + "\n");
+    buf.length = 0;
+  } catch (e: any) {
+    console.warn(`[scripts] flush failed for ${runId}: ${e.message}`);
+  }
+}
+
+function startFlushTimer(runId: string) {
+  const timer = setInterval(() => flushOutputBuffer(runId), OUTPUT_FLUSH_INTERVAL_MS);
+  runFlushTimers.set(runId, timer);
+}
+
+function stopFlushTimer(runId: string) {
+  const timer = runFlushTimers.get(runId);
+  if (timer) { clearInterval(timer); runFlushTimers.delete(runId); }
+  flushOutputBuffer(runId); // final flush
+  runOutputBuffers.delete(runId);
+}
+
+function readRunOutput(runId: string, offset?: number, limit?: number): { lines: string[]; totalBytes: number; offsetBytes: number; hasMore: boolean } {
+  const filePath = getRunOutputPath(runId);
+  let fileContent = "";
+  try { fileContent = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf-8") : ""; } catch { fileContent = ""; }
+  // Also append any unflushed buffer
+  const buf = runOutputBuffers.get(runId);
+  if (buf && buf.length > 0) fileContent += buf.join("\n") + "\n";
+
+  const totalBytes = Buffer.byteLength(fileContent, "utf-8");
+  const startByte = offset ?? 0;
+  const maxBytes = limit ?? OUTPUT_PAGE_BYTES;
+
+  if (startByte >= totalBytes) return { lines: [], totalBytes, offsetBytes: startByte, hasMore: false };
+
+  // Slice by byte offset
+  const contentBuf = Buffer.from(fileContent, "utf-8");
+  const endByte = Math.min(startByte + maxBytes, totalBytes);
+  const slice = contentBuf.subarray(startByte, endByte).toString("utf-8");
+  const lines = slice.split("\n");
+  // Remove trailing empty from split
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+  return { lines, totalBytes, offsetBytes: endByte, hasMore: endByte < totalBytes };
 }
 
 function loadScriptRuns() {
@@ -1122,11 +1184,18 @@ function saveScriptRuns() {
       byScript.set(run.scriptId, arr);
     }
     const kept: ScriptRun[] = [];
+    const removedIds = new Set<string>();
     for (const [, runs] of byScript) {
       runs.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
       kept.push(...runs.slice(0, MAX_RUNS_PER_SCRIPT));
+      for (const old of runs.slice(MAX_RUNS_PER_SCRIPT)) removedIds.add(old.id);
     }
     fs.writeFileSync(SCRIPT_RUNS_FILE, JSON.stringify(kept));
+    // Clean up old output files
+    for (const id of removedIds) {
+      scriptRuns.delete(id);
+      try { fs.unlinkSync(getRunOutputPath(id)); } catch {}
+    }
   } catch (e: any) {
     console.warn(`[scripts] failed to save runs: ${e.message}`);
   }
@@ -1183,13 +1252,23 @@ app.delete("/api/scripts/:id", (req, res) => {
 // REST API: Script runs
 app.get("/api/scripts/runs", (_req, res) => {
   const runs = [...scriptRuns.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
-  res.json(runs);
+  res.json(runs); // metadata only, no output
 });
 
 app.get("/api/scripts/runs/:id", (req, res) => {
   const run = scriptRuns.get(req.params.id);
   if (!run) { res.status(404).json({ error: "Run not found" }); return; }
-  res.json(run);
+  res.json(run); // metadata only
+});
+
+// Get paginated output for a run
+app.get("/api/scripts/runs/:id/output", (req, res) => {
+  const run = scriptRuns.get(req.params.id);
+  if (!run) { res.status(404).json({ error: "Run not found" }); return; }
+  const offset = parseInt(req.query.offset as string) || 0;
+  const limit = parseInt(req.query.limit as string) || OUTPUT_PAGE_BYTES;
+  const result = readRunOutput(req.params.id, offset, limit);
+  res.json({ ...result, status: run.status, exitCode: run.exitCode ?? null });
 });
 
 // Start a script run
@@ -1203,10 +1282,12 @@ app.post("/api/scripts/:id/run", (req, res) => {
     scriptId: config.id,
     scriptName: config.name,
     status: "running",
-    output: [],
     startedAt: new Date().toISOString(),
+    outputLines: 0,
   };
   scriptRuns.set(runId, run);
+  runOutputBuffers.set(runId, []);
+  startFlushTimer(runId);
 
   // Spawn the process — force UTF-8 on Windows (chcp 65001)
   const isWin = process.platform === "win32";
@@ -1229,11 +1310,11 @@ app.post("/api/scripts/:id/run", (req, res) => {
   activeScriptProcesses.set(runId, child);
   child.stdout?.setEncoding("utf8");
   child.stderr?.setEncoding("utf8");
+
   const appendOutput = (line: string) => {
-    run.output.push(line);
-    if (run.output.length > MAX_OUTPUT_LINES) {
-      run.output.splice(0, run.output.length - MAX_OUTPUT_LINES);
-    }
+    const buf = runOutputBuffers.get(runId);
+    if (buf) buf.push(line);
+    run.outputLines++;
     broadcastToAll({ type: "script_run_output", runId, line });
   };
 
@@ -1256,6 +1337,7 @@ app.post("/api/scripts/:id/run", (req, res) => {
     run.exitCode = code;
     run.completedAt = new Date().toISOString();
     activeScriptProcesses.delete(runId);
+    stopFlushTimer(runId);
     broadcastToAll({ type: "script_run_done", runId, status: run.status, exitCode: code });
     saveScriptRuns();
     console.log(`[scripts] run ${runId} completed: exit=${code}`);
@@ -1266,6 +1348,7 @@ app.post("/api/scripts/:id/run", (req, res) => {
     run.status = "failed";
     run.completedAt = new Date().toISOString();
     activeScriptProcesses.delete(runId);
+    stopFlushTimer(runId);
     broadcastToAll({ type: "script_run_done", runId, status: "failed", exitCode: null });
     saveScriptRuns();
   });
@@ -1290,6 +1373,7 @@ app.post("/api/scripts/runs/:id/kill", (req, res) => {
     run.status = "killed";
     run.completedAt = new Date().toISOString();
     activeScriptProcesses.delete(req.params.id);
+    stopFlushTimer(req.params.id);
     broadcastToAll({ type: "script_run_done", runId: req.params.id, status: "killed", exitCode: null });
     saveScriptRuns();
     res.json({ ok: true });
@@ -1413,10 +1497,12 @@ function getScriptTools(): Tool[] {
           scriptId: config.id,
           scriptName: config.name,
           status: "running",
-          output: [],
           startedAt: new Date().toISOString(),
+          outputLines: 0,
         };
         scriptRuns.set(runId, run);
+        runOutputBuffers.set(runId, []);
+        startFlushTimer(runId);
 
         const isWin = process.platform === "win32";
         const shellCmd = isWin
@@ -1430,8 +1516,9 @@ function getScriptTools(): Tool[] {
         child.stderr?.setEncoding("utf8");
 
         const appendOutput = (line: string) => {
-          run.output.push(line);
-          if (run.output.length > MAX_OUTPUT_LINES) run.output.splice(0, run.output.length - MAX_OUTPUT_LINES);
+          const buf = runOutputBuffers.get(runId);
+          if (buf) buf.push(line);
+          run.outputLines++;
           broadcastToAll({ type: "script_run_output", runId, line });
         };
 
@@ -1446,6 +1533,7 @@ function getScriptTools(): Tool[] {
           run.exitCode = code;
           run.completedAt = new Date().toISOString();
           activeScriptProcesses.delete(runId);
+          stopFlushTimer(runId);
           broadcastToAll({ type: "script_run_done", runId, status: run.status, exitCode: code });
           saveScriptRuns();
         });
@@ -1454,6 +1542,7 @@ function getScriptTools(): Tool[] {
           run.status = "failed";
           run.completedAt = new Date().toISOString();
           activeScriptProcesses.delete(runId);
+          stopFlushTimer(runId);
           broadcastToAll({ type: "script_run_done", runId, status: "failed", exitCode: null });
           saveScriptRuns();
         });
@@ -1465,12 +1554,14 @@ function getScriptTools(): Tool[] {
     },
     {
       name: "get_script_output",
-      description: "Get the output and status of a script run. Use 'tail' to get only the last N lines (useful for polling long-running processes). Both agent and user see the same output in the Scripts UI.",
+      description: "Get the output and status of a script run. Use 'tail' to get only the last N lines, or 'offset'/'limit' for byte-based pagination (default: last 64KB). Both agent and user see the same output in the Scripts UI.",
       parameters: {
         type: "object",
         properties: {
           runId: { type: "string", description: "The run ID returned by run_script" },
-          tail: { type: "number", description: "Return only the last N lines of output (default: all)" },
+          tail: { type: "number", description: "Return only the last N lines of output" },
+          offset: { type: "number", description: "Byte offset to start reading from (default: 0)" },
+          limit: { type: "number", description: "Max bytes to return (default: 64KB)" },
         },
         required: ["runId"],
       },
@@ -1478,16 +1569,27 @@ function getScriptTools(): Tool[] {
       handler: async (args: any) => {
         const run = scriptRuns.get(args.runId);
         if (!run) return JSON.stringify({ error: "Run not found" });
-        const lines = args.tail ? run.output.slice(-args.tail) : run.output;
+
+        if (args.tail) {
+          // Tail mode: read entire output, return last N lines
+          const all = readRunOutput(args.runId, 0, Infinity);
+          const lines = all.lines.slice(-args.tail);
+          return JSON.stringify({
+            runId: run.id, scriptName: run.scriptName, status: run.status,
+            exitCode: run.exitCode ?? null, startedAt: run.startedAt,
+            completedAt: run.completedAt ?? null, totalLines: run.outputLines,
+            output: lines,
+          });
+        }
+
+        // Paginated mode
+        const result = readRunOutput(args.runId, args.offset ?? 0, args.limit ?? OUTPUT_PAGE_BYTES);
         return JSON.stringify({
-          runId: run.id,
-          scriptName: run.scriptName,
-          status: run.status,
-          exitCode: run.exitCode ?? null,
-          startedAt: run.startedAt,
-          completedAt: run.completedAt ?? null,
-          totalLines: run.output.length,
-          output: lines,
+          runId: run.id, scriptName: run.scriptName, status: run.status,
+          exitCode: run.exitCode ?? null, startedAt: run.startedAt,
+          completedAt: run.completedAt ?? null, totalLines: run.outputLines,
+          totalBytes: result.totalBytes, offsetBytes: result.offsetBytes,
+          hasMore: result.hasMore, output: result.lines,
         });
       },
     },
@@ -1513,6 +1615,7 @@ function getScriptTools(): Tool[] {
         run.status = "killed";
         run.completedAt = new Date().toISOString();
         activeScriptProcesses.delete(args.runId);
+        stopFlushTimer(args.runId);
         broadcastToAll({ type: "script_run_done", runId: args.runId, status: "killed", exitCode: null });
         saveScriptRuns();
         return JSON.stringify({ ok: true, status: "killed" });

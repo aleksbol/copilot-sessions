@@ -11,6 +11,9 @@
   let ws = null;
   let editingScriptId = null; // null = adding, string = editing
   let autoScroll = true;
+  let outputOffset = 0;    // current byte offset loaded
+  let outputHasMore = false;
+  let loadingOutput = false;
 
   // ── DOM refs ──
   const scriptListEl = document.getElementById("script-list");
@@ -64,17 +67,18 @@
         if (msg.run.scriptId === selectedScriptId) {
           selectedRunId = msg.run.id;
           renderRunHistory();
-          renderOutput();
+          // Reset output for this new run — will stream via WS
+          outputLog.textContent = "";
+          outputOffset = 0;
+          outputHasMore = false;
+          updateKillButton();
+          updateOutputTitle();
         }
         renderScriptList();
         break;
       case "script_run_output":
-        const run = runs.find(r => r.id === msg.runId);
-        if (run) {
-          run.output.push(msg.line);
-          if (msg.runId === selectedRunId) {
-            appendOutputLine(msg.line);
-          }
+        if (msg.runId === selectedRunId) {
+          appendOutputLine(msg.line);
         }
         break;
       case "script_run_done": {
@@ -180,20 +184,62 @@
     }
   }
 
-  function renderOutput() {
+  async function renderOutput() {
     outputLog.textContent = "";
     autoScroll = true;
+    outputOffset = 0;
+    outputHasMore = false;
     const run = runs.find(r => r.id === selectedRunId);
     if (!run) {
       updateKillButton();
       updateOutputTitle();
       return;
     }
-    for (const line of run.output) {
-      appendOutputLine(line);
-    }
+    // Load first page of output from server
+    await loadOutputPage();
     updateKillButton();
     updateOutputTitle();
+  }
+
+  async function loadOutputPage() {
+    if (!selectedRunId || loadingOutput) return;
+    loadingOutput = true;
+    try {
+      const data = await api(`/api/scripts/runs/${selectedRunId}/output?offset=${outputOffset}`);
+      for (const line of data.lines) {
+        appendOutputLine(line);
+      }
+      outputOffset = data.offsetBytes;
+      outputHasMore = data.hasMore;
+      if (outputHasMore) {
+        showLoadMoreBtn();
+      } else {
+        hideLoadMoreBtn();
+      }
+    } catch (e) {
+      appendOutputLine(`[error loading output: ${e.message}]`);
+    } finally {
+      loadingOutput = false;
+    }
+  }
+
+  function showLoadMoreBtn() {
+    let btn = document.getElementById("load-more-output");
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.id = "load-more-output";
+      btn.className = "dialog-btn dialog-btn-secondary";
+      btn.style.cssText = "margin: 8px 20px; font-size: 12px;";
+      btn.textContent = "Load more output…";
+      btn.onclick = loadOutputPage;
+      outputLog.parentElement.insertBefore(btn, outputLog.nextSibling);
+    }
+    btn.style.display = "";
+  }
+
+  function hideLoadMoreBtn() {
+    const btn = document.getElementById("load-more-output");
+    if (btn) btn.style.display = "none";
   }
 
   function appendOutputLine(line) {
