@@ -11,8 +11,8 @@
   let ws = null;
   let editingScriptId = null; // null = adding, string = editing
   let autoScroll = true;
-  let outputOffset = 0;    // current byte offset loaded
-  let outputHasMore = false;
+  let outputOffset = 0;       // byte offset of earliest content loaded
+  let outputHasEarlier = false;
   let loadingOutput = false;
 
   // ── DOM refs ──
@@ -70,7 +70,7 @@
           // Reset output for this new run — will stream via WS
           outputLog.textContent = "";
           outputOffset = 0;
-          outputHasMore = false;
+          outputHasEarlier = false;
           updateKillButton();
           updateOutputTitle();
         }
@@ -190,33 +190,34 @@
     outputLog.textContent = "";
     autoScroll = true;
     outputOffset = 0;
-    outputHasMore = false;
+    outputHasEarlier = false;
+    hideLoadMoreBtn();
     const run = runs.find(r => r.id === selectedRunId);
     if (!run) {
       updateKillButton();
       updateOutputTitle();
       return;
     }
-    // Load first page of output from server
-    await loadOutputPage();
+    // Load last page of output (tail)
+    await loadOutputTail();
     updateKillButton();
     updateOutputTitle();
+    // Scroll to bottom
+    outputLog.scrollTop = outputLog.scrollHeight;
   }
 
-  async function loadOutputPage() {
+  async function loadOutputTail() {
     if (!selectedRunId || loadingOutput) return;
     loadingOutput = true;
     try {
-      const data = await api(`/api/scripts/runs/${selectedRunId}/output?offset=${outputOffset}`);
+      const data = await api(`/api/scripts/runs/${selectedRunId}/output?tail=65536`);
       for (const line of data.lines) {
         appendOutputLine(line);
       }
-      outputOffset = data.offsetBytes;
-      outputHasMore = data.hasMore;
-      if (outputHasMore) {
-        showLoadMoreBtn();
-      } else {
-        hideLoadMoreBtn();
+      outputOffset = data.startByte;
+      outputHasEarlier = data.startByte > 0;
+      if (outputHasEarlier) {
+        showLoadEarlierBtn();
       }
     } catch (e) {
       appendOutputLine(`[error loading output: ${e.message}]`);
@@ -225,17 +226,53 @@
     }
   }
 
-  function showLoadMoreBtn() {
+  async function loadEarlierOutput() {
+    if (!selectedRunId || loadingOutput || outputOffset <= 0) return;
+    loadingOutput = true;
+    try {
+      const chunkSize = 65536;
+      const start = Math.max(0, outputOffset - chunkSize);
+      const limit = outputOffset - start;
+      const data = await api(`/api/scripts/runs/${selectedRunId}/output?offset=${start}&limit=${limit}`);
+
+      // Save scroll position relative to bottom
+      const prevHeight = outputLog.scrollHeight;
+      const prevTop = outputLog.scrollTop;
+
+      // Prepend lines at the top
+      const frag = document.createDocumentFragment();
+      for (const line of data.lines) {
+        frag.appendChild(document.createTextNode(line + "\n"));
+      }
+      outputLog.insertBefore(frag, outputLog.firstChild);
+
+      // Restore scroll position
+      const newHeight = outputLog.scrollHeight;
+      outputLog.scrollTop = prevTop + (newHeight - prevHeight);
+
+      outputOffset = start;
+      outputHasEarlier = start > 0;
+      if (!outputHasEarlier) {
+        hideLoadMoreBtn();
+      }
+    } catch (e) {
+      appendOutputLine(`[error loading earlier output: ${e.message}]`);
+    } finally {
+      loadingOutput = false;
+    }
+  }
+
+  function showLoadEarlierBtn() {
     let btn = document.getElementById("load-more-output");
     if (!btn) {
       btn = document.createElement("button");
       btn.id = "load-more-output";
       btn.className = "dialog-btn dialog-btn-secondary";
       btn.style.cssText = "margin: 8px 20px; font-size: 12px;";
-      btn.textContent = "Load more output…";
-      btn.onclick = loadOutputPage;
-      outputLog.parentElement.insertBefore(btn, outputLog.nextSibling);
+      outputLog.parentElement.insertBefore(btn, outputLog);
     }
+    btn.textContent = "Load earlier output…";
+    btn.onclick = loadEarlierOutput;
     btn.style.display = "";
   }
 

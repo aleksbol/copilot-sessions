@@ -1265,6 +1265,18 @@ app.get("/api/scripts/runs/:id", (req, res) => {
 app.get("/api/scripts/runs/:id/output", (req, res) => {
   const run = scriptRuns.get(req.params.id);
   if (!run) { res.status(404).json({ error: "Run not found" }); return; }
+
+  const tailParam = req.query.tail ? parseInt(req.query.tail as string) : undefined;
+  if (tailParam !== undefined) {
+    // Tail mode: read last N bytes
+    const result = readRunOutput(req.params.id, 0, Infinity);
+    const totalBytes = result.totalBytes;
+    const startByte = Math.max(0, totalBytes - tailParam);
+    const tailResult = readRunOutput(req.params.id, startByte, tailParam);
+    res.json({ ...tailResult, startByte, status: run.status, exitCode: run.exitCode ?? null });
+    return;
+  }
+
   const offset = parseInt(req.query.offset as string) || 0;
   const limit = parseInt(req.query.limit as string) || OUTPUT_PAGE_BYTES;
   const result = readRunOutput(req.params.id, offset, limit);
