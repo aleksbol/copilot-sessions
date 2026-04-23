@@ -436,7 +436,13 @@
 
   // ── Markdown setup ──
 
-  marked.use({ breaks: true, gfm: true });
+  const renderer = new marked.Renderer();
+  const origLinkRenderer = renderer.link.bind(renderer);
+  renderer.link = function(token) {
+    const html = origLinkRenderer(token);
+    return html.replace('<a ', '<a target="_blank" rel="noopener noreferrer" ');
+  };
+  marked.use({ breaks: true, gfm: true, renderer });
 
   // Syntax highlight after rendering
   function highlightRenderedCode(el) {
