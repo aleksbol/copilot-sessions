@@ -437,10 +437,9 @@
   // ── Markdown setup ──
 
   const renderer = new marked.Renderer();
-  const origLinkRenderer = renderer.link.bind(renderer);
-  renderer.link = function(token) {
-    const html = origLinkRenderer(token);
-    return html.replace('<a ', '<a target="_blank" rel="noopener noreferrer" ');
+  renderer.link = function({ href, title, text }) {
+    const titleAttr = title ? ` title="${title}"` : "";
+    return `<a href="${href}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
   };
   marked.use({ breaks: true, gfm: true, renderer });
 
