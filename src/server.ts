@@ -1377,10 +1377,11 @@ app.post("/api/scripts/runs/:id/kill", (req, res) => {
   const child = activeScriptProcesses.get(req.params.id);
   if (!child) { res.status(400).json({ error: "Process not running" }); return; }
   try {
-    child.kill("SIGTERM");
-    // On Windows, SIGTERM may not work — use taskkill
     if (process.platform === "win32" && child.pid) {
+      // On Windows, must use taskkill /T to kill the entire process tree
       try { execSync(`taskkill /PID ${child.pid} /T /F`, { stdio: "ignore" }); } catch {}
+    } else {
+      child.kill("SIGTERM");
     }
     run.status = "killed";
     run.completedAt = new Date().toISOString();
@@ -1620,9 +1621,10 @@ function getScriptTools(): Tool[] {
         if (!run) return JSON.stringify({ error: "Run not found" });
         const child = activeScriptProcesses.get(args.runId);
         if (!child) return JSON.stringify({ error: "Process not running" });
-        child.kill("SIGTERM");
         if (process.platform === "win32" && child.pid) {
           try { execSync(`taskkill /PID ${child.pid} /T /F`, { stdio: "ignore" }); } catch {}
+        } else {
+          child.kill("SIGTERM");
         }
         run.status = "killed";
         run.completedAt = new Date().toISOString();
