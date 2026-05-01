@@ -436,17 +436,7 @@
 
   // ── Markdown setup ──
 
-  marked.use({
-    breaks: true,
-    gfm: true,
-    renderer: {
-      link({ href, title, tokens }) {
-        const text = this.parser.parseInline(tokens);
-        const titleAttr = title ? ` title="${title}"` : "";
-        return `<a href="${href}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
-      }
-    }
-  });
+  marked.use({ breaks: true, gfm: true });
 
   // Syntax highlight after rendering
   function highlightRenderedCode(el) {
@@ -1864,7 +1854,9 @@
 
   function renderMarkdown(text) {
     try {
-      return marked.parse(text);
+      const html = marked.parse(text);
+      // Open all links in new tab
+      return html.replace(/<a /g, '<a target="_blank" rel="noopener noreferrer" ');
     } catch(e) {
       console.error("[markdown] render error:", e);
       return escapeHtml(text);
