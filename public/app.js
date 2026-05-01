@@ -436,12 +436,17 @@
 
   // ── Markdown setup ──
 
-  const renderer = new marked.Renderer();
-  renderer.link = function({ href, title, text }) {
-    const titleAttr = title ? ` title="${title}"` : "";
-    return `<a href="${href}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
-  };
-  marked.use({ breaks: true, gfm: true, renderer });
+  marked.use({
+    breaks: true,
+    gfm: true,
+    renderer: {
+      link({ href, title, tokens }) {
+        const text = this.parser.parseInline(tokens);
+        const titleAttr = title ? ` title="${title}"` : "";
+        return `<a href="${href}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
+      }
+    }
+  });
 
   // Syntax highlight after rendering
   function highlightRenderedCode(el) {
