@@ -1730,7 +1730,32 @@ async function fireSchedule(scheduleId: string) {
 
     activeTurns.add(sched.sessionId);
     try {
-      const result = await session.sendAndWait({ prompt }, 3_600_000);
+      let result;
+      try {
+        result = await session.sendAndWait({ prompt }, 3_600_000);
+      } catch (sendErr: any) {
+        const errMsg = sendErr?.message ?? String(sendErr);
+        // CLI lost the session — re-resume and retry once
+        if (errMsg.includes("Session not found") || errMsg.includes("session not found")) {
+          console.log(`[schedules] session lost in CLI for ${sched.sessionId.substring(0, 8)} — re-resuming...`);
+          activeSessions.delete(sched.sessionId);
+          boundSessionIds.delete(sched.sessionId);
+          const reSession = await copilot.resumeSession(sched.sessionId, {
+            streaming: true,
+            onPermissionRequest: approveAll,
+            onUserInputRequest: createUserInputHandler(sched.sessionId),
+            onElicitationRequest: createElicitationHandler(sched.sessionId),
+            tools: [...getScriptTools(), ...getScheduleTools(sched.sessionId)],
+            ...(mcpServers ? { mcpServers } : {}),
+          });
+          activeSessions.set(sched.sessionId, reSession);
+          bindSessionEvents(reSession, sched.sessionId);
+          session = reSession;
+          result = await session.sendAndWait({ prompt }, 3_600_000);
+        } else {
+          throw sendErr;
+        }
+      }
       const data = result?.data as any;
       const content = data?.content ?? "";
 
