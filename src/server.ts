@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import { parse as parseCookie, serialize as serializeCookie } from "cookie";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import * as cron from "node-cron";
 
 // Load .env from project root
 dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".env") });
@@ -1773,15 +1774,13 @@ async function fireSchedule(scheduleId: string) {
 }
 
 function startScheduleTask(sched: Schedule) {
-  // Lazily import to avoid breaking if module missing
-  const cron = require("node-cron");
   if (!cron.validate(sched.cron)) {
     console.warn(`[schedules] invalid cron "${sched.cron}" for ${sched.id}`);
     return;
   }
   const task = cron.schedule(sched.cron, () => {
     fireSchedule(sched.id).catch(e => console.error(`[schedules] fireSchedule error:`, e));
-  }, { scheduled: true });
+  });
   cronTasks.set(sched.id, task);
 }
 
@@ -1816,7 +1815,6 @@ app.post("/api/schedules", (req, res) => {
     res.status(400).json({ error: "sessionId, name, cron, and message are required" });
     return;
   }
-  const cron = require("node-cron");
   if (!cron.validate(cronExpr)) {
     res.status(400).json({ error: `Invalid cron expression: ${cronExpr}` });
     return;
@@ -1839,7 +1837,6 @@ app.put("/api/schedules/:id", (req, res) => {
   const sched = schedules.get(req.params.id);
   if (!sched) { res.status(404).json({ error: "Schedule not found" }); return; }
   const { name, cron: cronExpr, message, enabled } = req.body;
-  const cron = require("node-cron");
   if (cronExpr !== undefined && !cron.validate(cronExpr)) {
     res.status(400).json({ error: `Invalid cron expression: ${cronExpr}` });
     return;

@@ -2643,8 +2643,9 @@
       const method = editingScheduleId ? "PUT" : "POST";
       const res = await fetch(url, { method, headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) });
       if (!res.ok) {
-        const err = await res.json();
-        alert("Error: " + (err.error || res.statusText));
+        let errMsg = res.statusText;
+        try { const err = await res.json(); errMsg = err.error || errMsg; } catch {}
+        alert("Error: " + errMsg);
         return;
       }
       closeScheduleDialog();
