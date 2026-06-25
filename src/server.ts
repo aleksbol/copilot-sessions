@@ -1638,6 +1638,278 @@ function getScriptTools(): Tool[] {
   ];
 }
 
+// ── Scheduled Messages ──
+
+interface Schedule {
+  id: string;
+  sessionId: string;
+  name: string;          // human-readable label
+  cron: string;          // cron expression (server local timezone)
+  message: string;       // the prompt to send to the agent
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastRunAt?: string;    // ISO timestamp
+  lastError?: string;
+  runCount: number;
+}
+
+const SCHEDULES_FILE = path.join(process.env.USERPROFILE || process.env.HOME || "", ".copilot", "schedules.json");
+const schedules = new Map<string, Schedule>();
+const cronTasks = new Map<string, any>(); // scheduleId → node-cron task
+const activeTurns = new Set<string>();    // sessionIds currently busy with sendAndWait
+const pendingScheduleQueue = new Map<string, string[]>(); // sessionId → queued scheduleIds (waiting for turn to finish)
+
+function loadSchedules() {
+  try {
+    if (fs.existsSync(SCHEDULES_FILE)) {
+      const data: Schedule[] = JSON.parse(fs.readFileSync(SCHEDULES_FILE, "utf-8"));
+      for (const s of data) schedules.set(s.id, s);
+      console.log(`[schedules] loaded ${schedules.size} schedule(s)`);
+    }
+  } catch (e: any) {
+    console.warn(`[schedules] failed to load: ${e.message}`);
+  }
+}
+
+function saveSchedules() {
+  try {
+    fs.writeFileSync(SCHEDULES_FILE, JSON.stringify([...schedules.values()], null, 2));
+  } catch (e: any) {
+    console.warn(`[schedules] failed to save: ${e.message}`);
+  }
+}
+
+async function fireSchedule(scheduleId: string) {
+  const sched = schedules.get(scheduleId);
+  if (!sched || !sched.enabled) return;
+
+  // If a turn is already in progress, queue this trigger for after it completes.
+  if (activeTurns.has(sched.sessionId)) {
+    const q = pendingScheduleQueue.get(sched.sessionId) ?? [];
+    if (!q.includes(scheduleId)) {
+      q.push(scheduleId);
+      pendingScheduleQueue.set(sched.sessionId, q);
+      console.log(`[schedules] ${scheduleId.substring(0, 8)} queued — session ${sched.sessionId.substring(0, 8)} busy`);
+    }
+    return;
+  }
+
+  console.log(`[schedules] firing ${scheduleId.substring(0, 8)} → ${sched.sessionId.substring(0, 8)}: "${sched.message.substring(0, 60)}..."`);
+
+  // Build the prompt with a marker so the agent knows this is automated
+  const prompt = `[Scheduled task: "${sched.name}" — triggered at ${new Date().toISOString()}]\n\n${sched.message}`;
+
+  // Broadcast the user message immediately so clients see it appear in chat
+  broadcast(sched.sessionId, {
+    type: "user_message",
+    sessionId: sched.sessionId,
+    content: prompt,
+  });
+
+  try {
+    // Resume the session if it isn't currently active
+    let session = activeSessions.get(sched.sessionId);
+    if (!session) {
+      try {
+        session = await copilot.resumeSession(sched.sessionId, {
+          streaming: true,
+          onPermissionRequest: approveAll,
+          onUserInputRequest: createUserInputHandler(sched.sessionId),
+          onElicitationRequest: createElicitationHandler(sched.sessionId),
+          tools: [...getScriptTools(), ...getScheduleTools(sched.sessionId)],
+          ...(mcpServers ? { mcpServers } : {}),
+        });
+        activeSessions.set(sched.sessionId, session);
+        bindSessionEvents(session, sched.sessionId);
+      } catch (resumeErr: any) {
+        throw new Error(`resume failed: ${resumeErr?.message ?? resumeErr}`);
+      }
+    }
+
+    activeTurns.add(sched.sessionId);
+    try {
+      const result = await session.sendAndWait({ prompt }, 3_600_000);
+      const data = result?.data as any;
+      const content = data?.content ?? "";
+
+      // Update search index
+      updateSearchIndexForSession(sched.sessionId, prompt, content);
+
+      const eventsHandled = turnDeliveredByEvents.get(sched.sessionId) ?? false;
+      turnDeliveredByEvents.set(sched.sessionId, false);
+      if (!eventsHandled && content) {
+        broadcast(sched.sessionId, { type: "assistant_message", sessionId: sched.sessionId, content });
+        broadcast(sched.sessionId, { type: "done", sessionId: sched.sessionId });
+      }
+    } finally {
+      activeTurns.delete(sched.sessionId);
+    }
+
+    sched.lastRunAt = new Date().toISOString();
+    sched.lastError = undefined;
+    sched.runCount++;
+    saveSchedules();
+  } catch (e: any) {
+    sched.lastError = e?.message ?? String(e);
+    sched.lastRunAt = new Date().toISOString();
+    saveSchedules();
+    console.error(`[schedules] ${scheduleId.substring(0, 8)} failed:`, sched.lastError);
+    broadcast(sched.sessionId, {
+      type: "error",
+      sessionId: sched.sessionId,
+      message: `Scheduled task "${sched.name}" failed: ${sched.lastError}`,
+    });
+  }
+
+  // Drain any queued schedule triggers for this session
+  const queued = pendingScheduleQueue.get(sched.sessionId);
+  if (queued && queued.length > 0) {
+    const nextId = queued.shift()!;
+    if (queued.length === 0) pendingScheduleQueue.delete(sched.sessionId);
+    else pendingScheduleQueue.set(sched.sessionId, queued);
+    setImmediate(() => fireSchedule(nextId));
+  }
+}
+
+function startScheduleTask(sched: Schedule) {
+  // Lazily import to avoid breaking if module missing
+  const cron = require("node-cron");
+  if (!cron.validate(sched.cron)) {
+    console.warn(`[schedules] invalid cron "${sched.cron}" for ${sched.id}`);
+    return;
+  }
+  const task = cron.schedule(sched.cron, () => {
+    fireSchedule(sched.id).catch(e => console.error(`[schedules] fireSchedule error:`, e));
+  }, { scheduled: true });
+  cronTasks.set(sched.id, task);
+}
+
+function stopScheduleTask(scheduleId: string) {
+  const task = cronTasks.get(scheduleId);
+  if (task) {
+    try { task.stop(); } catch {}
+    cronTasks.delete(scheduleId);
+  }
+}
+
+function startAllSchedules() {
+  for (const s of schedules.values()) {
+    if (s.enabled) startScheduleTask(s);
+  }
+  console.log(`[schedules] activated ${cronTasks.size} cron task(s)`);
+}
+
+loadSchedules();
+startAllSchedules();
+
+// REST API: list schedules (optionally filtered by session)
+app.get("/api/schedules", (req, res) => {
+  const sessionId = req.query.sessionId as string | undefined;
+  const all = [...schedules.values()];
+  res.json(sessionId ? all.filter(s => s.sessionId === sessionId) : all);
+});
+
+app.post("/api/schedules", (req, res) => {
+  const { sessionId, name, cron: cronExpr, message, enabled } = req.body;
+  if (!sessionId || !name || !cronExpr || !message) {
+    res.status(400).json({ error: "sessionId, name, cron, and message are required" });
+    return;
+  }
+  const cron = require("node-cron");
+  if (!cron.validate(cronExpr)) {
+    res.status(400).json({ error: `Invalid cron expression: ${cronExpr}` });
+    return;
+  }
+  const sched: Schedule = {
+    id: crypto.randomBytes(8).toString("hex"),
+    sessionId, name, cron: cronExpr, message,
+    enabled: enabled !== false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    runCount: 0,
+  };
+  schedules.set(sched.id, sched);
+  saveSchedules();
+  if (sched.enabled) startScheduleTask(sched);
+  res.json(sched);
+});
+
+app.put("/api/schedules/:id", (req, res) => {
+  const sched = schedules.get(req.params.id);
+  if (!sched) { res.status(404).json({ error: "Schedule not found" }); return; }
+  const { name, cron: cronExpr, message, enabled } = req.body;
+  const cron = require("node-cron");
+  if (cronExpr !== undefined && !cron.validate(cronExpr)) {
+    res.status(400).json({ error: `Invalid cron expression: ${cronExpr}` });
+    return;
+  }
+  if (name !== undefined) sched.name = name;
+  if (cronExpr !== undefined) sched.cron = cronExpr;
+  if (message !== undefined) sched.message = message;
+  if (enabled !== undefined) sched.enabled = enabled;
+  sched.updatedAt = new Date().toISOString();
+  saveSchedules();
+  // Restart the cron task with new settings
+  stopScheduleTask(sched.id);
+  if (sched.enabled) startScheduleTask(sched);
+  res.json(sched);
+});
+
+app.delete("/api/schedules/:id", (req, res) => {
+  const sched = schedules.get(req.params.id);
+  if (!sched) { res.status(404).json({ error: "Schedule not found" }); return; }
+  stopScheduleTask(sched.id);
+  schedules.delete(sched.id);
+  saveSchedules();
+  res.json({ ok: true });
+});
+
+// Read-only/disable tools for the agent
+function getScheduleTools(sessionId: string): Tool[] {
+  return [
+    {
+      name: "list_schedules",
+      description: "List scheduled messages for the current chat session. Use to see what automated tasks are configured.",
+      parameters: { type: "object", properties: {}, required: [] },
+      skipPermission: true,
+      handler: async () => {
+        const list = [...schedules.values()]
+          .filter(s => s.sessionId === sessionId)
+          .map(s => ({
+            id: s.id, name: s.name, cron: s.cron, message: s.message,
+            enabled: s.enabled, lastRunAt: s.lastRunAt ?? null,
+            lastError: s.lastError ?? null, runCount: s.runCount,
+          }));
+        return JSON.stringify(list);
+      },
+    },
+    {
+      name: "disable_schedule",
+      description: "Disable a scheduled message for the current session by ID. Use if you detect that an automated task is misbehaving or no longer makes sense.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "The schedule ID to disable" },
+          reason: { type: "string", description: "Optional reason logged for audit" },
+        },
+        required: ["id"],
+      },
+      handler: async (args: any) => {
+        const sched = schedules.get(args.id);
+        if (!sched) return JSON.stringify({ error: "Schedule not found" });
+        if (sched.sessionId !== sessionId) return JSON.stringify({ error: "Schedule belongs to a different session" });
+        sched.enabled = false;
+        sched.updatedAt = new Date().toISOString();
+        stopScheduleTask(sched.id);
+        saveSchedules();
+        console.log(`[schedules] agent disabled ${sched.id.substring(0, 8)}${args.reason ? ` reason="${args.reason}"` : ""}`);
+        return JSON.stringify({ ok: true, id: sched.id, enabled: false });
+      },
+    },
+  ];
+}
+
 const server = http.createServer(app);
 
 // ── WebSocket server (with auth gate on upgrade) ──
@@ -2197,6 +2469,7 @@ wss.on("connection", (ws: any) => {
           // The session.on() listener does NOT receive assistant.message/turn_start/turn_end
           // in current SDK versions — so we rely on the return value for the response.
           let lastContent = "";
+          activeTurns.add(msg.sessionId);
           try {
             const result = await session.sendAndWait(
               { prompt },
@@ -2324,7 +2597,7 @@ wss.on("connection", (ws: any) => {
                   onPermissionRequest: approveAll,
                   onUserInputRequest: createUserInputHandler(msg.sessionId),
                   onElicitationRequest: createElicitationHandler(msg.sessionId),
-                  tools: getScriptTools(),
+                  tools: [...getScriptTools(), ...getScheduleTools(msg.sessionId)],
                   ...(mcpServers ? { mcpServers } : {}),
                 });
                 activeSessions.set(msg.sessionId, reSession);
@@ -2428,6 +2701,16 @@ wss.on("connection", (ws: any) => {
               sessionId: msg.sessionId,
               message: `Send error: ${errMsg}`,
             });
+          } finally {
+            activeTurns.delete(msg.sessionId);
+            // Drain any schedule triggers that were queued while the user turn was in progress
+            const queued = pendingScheduleQueue.get(msg.sessionId);
+            if (queued && queued.length > 0) {
+              const nextId = queued.shift()!;
+              if (queued.length === 0) pendingScheduleQueue.delete(msg.sessionId);
+              else pendingScheduleQueue.set(msg.sessionId, queued);
+              setImmediate(() => fireSchedule(nextId).catch(e => console.error(`[schedules] drain error:`, e)));
+            }
           }
           break;
         }
@@ -2488,7 +2771,7 @@ wss.on("connection", (ws: any) => {
                 onPermissionRequest: approveAll,
                 onUserInputRequest: createUserInputHandler(sessionId),
                 onElicitationRequest: createElicitationHandler(sessionId),
-                tools: getScriptTools(),
+                tools: [...getScriptTools(), ...getScheduleTools(sessionId)],
                 ...(mcpServers ? { mcpServers } : {}),
               });
             } catch (resumeErr: any) {
@@ -2554,7 +2837,7 @@ wss.on("connection", (ws: any) => {
                         onPermissionRequest: approveAll,
                         onUserInputRequest: createUserInputHandler(sessionId),
                         onElicitationRequest: createElicitationHandler(sessionId),
-                        tools: getScriptTools(),
+                        tools: [...getScriptTools(), ...getScheduleTools(sessionId)],
                         ...(mcpServers ? { mcpServers } : {}),
                       });
                       activeSessions.set(sessionId, reSession);
@@ -2647,6 +2930,15 @@ wss.on("connection", (ws: any) => {
           sessionEventBuffers.delete(sessionId);
           sessionHistoryCache.delete(sessionId);
           turnDeliveredByEvents.delete(sessionId);
+          // Clean up any schedules for this session
+          for (const [sid, sched] of [...schedules.entries()]) {
+            if (sched.sessionId === sessionId) {
+              stopScheduleTask(sid);
+              schedules.delete(sid);
+            }
+          }
+          pendingScheduleQueue.delete(sessionId);
+          saveSchedules();
           try {
             await copilot.deleteSession(sessionId);
           } catch (e: any) {

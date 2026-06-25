@@ -78,6 +78,26 @@
   const snapshotCancel = document.getElementById("snapshot-cancel");
   const snapshotSave = document.getElementById("snapshot-save");
   const newSnapshotSelect = document.getElementById("new-snapshot-select");
+  const schedulesBtn = document.getElementById("schedules-btn");
+  const schedulesBadge = document.getElementById("schedules-badge");
+  const schedulesPanel = document.getElementById("schedules-panel");
+  const schedulesOverlay = document.getElementById("schedules-overlay");
+  const schedulesCloseBtn = document.getElementById("schedules-close-btn");
+  const scheduleAddBtn = document.getElementById("schedule-add-btn");
+  const schedulesListEl = document.getElementById("schedules-list");
+  const scheduleDialog = document.getElementById("schedule-dialog");
+  const scheduleDialogTitle = document.getElementById("schedule-dialog-title");
+  const scheduleDialogCancel = document.getElementById("schedule-dialog-cancel");
+  const scheduleDialogSave = document.getElementById("schedule-dialog-save");
+  const schedFrequency = document.getElementById("sched-frequency");
+  const schedTimeRow = document.getElementById("sched-time-row");
+  const schedTime = document.getElementById("sched-time");
+  const schedWeekdayRow = document.getElementById("sched-weekday-row");
+  const schedWeekday = document.getElementById("sched-weekday");
+  const schedCronRow = document.getElementById("sched-cron-row");
+  const schedCron = document.getElementById("sched-cron");
+  const schedName = document.getElementById("sched-name");
+  const schedMessage = document.getElementById("sched-message");
   const searchInput = document.getElementById("search-input");
   const searchClear = document.getElementById("search-clear");
   const searchResults = document.getElementById("search-results");
@@ -160,6 +180,11 @@
   // Show/hide snapshot button based on active session
   function updateSnapshotBtn() {
     if (snapshotBtn) snapshotBtn.style.display = currentSessionId ? "" : "none";
+    if (schedulesBtn) {
+      schedulesBtn.style.display = currentSessionId ? "" : "none";
+      if (currentSessionId) fetchSchedules();
+      else { schedules = []; updateSchedulesBadge(); }
+    }
   }
 
   if (snapshotBtn) {
@@ -2418,6 +2443,255 @@
       processesListEl.appendChild(item);
     }
   }
+
+  // ── Schedules ──
+
+  let schedules = [];
+  let editingScheduleId = null;
+
+  async function fetchSchedules() {
+    if (!currentSessionId) return;
+    try {
+      const res = await fetch(`/api/schedules?sessionId=${currentSessionId}`);
+      schedules = await res.json();
+      renderSchedules();
+      updateSchedulesBadge();
+    } catch (e) {
+      console.error("fetchSchedules error:", e);
+    }
+  }
+
+  function updateSchedulesBadge() {
+    const enabled = schedules.filter(s => s.enabled).length;
+    if (enabled > 0) {
+      schedulesBadge.textContent = enabled;
+      schedulesBadge.style.display = "flex";
+    } else {
+      schedulesBadge.style.display = "none";
+    }
+  }
+
+  function describeCron(cron) {
+    // Try to produce a human-friendly label for common patterns
+    const m = cron.match(/^(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)$/);
+    if (!m) return cron;
+    const [, min, hour, dom, mon, dow] = m;
+    const time = `${String(hour).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+    if (dom === "*" && mon === "*") {
+      if (dow === "*") return `Daily at ${time}`;
+      if (dow === "1-5") return `Weekdays at ${time}`;
+      const days = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+      if (/^\d$/.test(dow)) return `Every ${days[Number(dow)]} at ${time}`;
+    }
+    if (dom === "1" && mon === "*" && dow === "*") return `Monthly 1st at ${time}`;
+    return cron;
+  }
+
+  function renderSchedules() {
+    schedulesListEl.innerHTML = "";
+    if (schedules.length === 0) {
+      schedulesListEl.innerHTML = '<div class="processes-empty">No schedules yet. Click + to add one.</div>';
+      return;
+    }
+    for (const s of schedules) {
+      const item = document.createElement("div");
+      item.className = "schedule-item" + (s.enabled ? "" : " disabled");
+
+      const header = document.createElement("div");
+      header.className = "schedule-item-header";
+      const nameEl = document.createElement("div");
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "schedule-item-name";
+      nameSpan.textContent = s.name;
+      nameEl.appendChild(nameSpan);
+      const whenSpan = document.createElement("div");
+      whenSpan.className = "schedule-item-when";
+      whenSpan.textContent = describeCron(s.cron);
+      nameEl.appendChild(whenSpan);
+
+      const actions = document.createElement("div");
+      actions.className = "schedule-item-actions";
+      const toggleBtn = document.createElement("button");
+      toggleBtn.className = "btn-icon";
+      toggleBtn.title = s.enabled ? "Disable" : "Enable";
+      toggleBtn.textContent = s.enabled ? "⏸" : "▶";
+      toggleBtn.onclick = () => toggleSchedule(s.id, !s.enabled);
+      const editBtn = document.createElement("button");
+      editBtn.className = "btn-icon";
+      editBtn.title = "Edit";
+      editBtn.textContent = "✎";
+      editBtn.onclick = () => openScheduleDialog(s.id);
+      const delBtn = document.createElement("button");
+      delBtn.className = "btn-icon";
+      delBtn.title = "Delete";
+      delBtn.textContent = "🗑";
+      delBtn.onclick = () => deleteSchedule(s.id);
+      actions.appendChild(toggleBtn);
+      actions.appendChild(editBtn);
+      actions.appendChild(delBtn);
+
+      header.appendChild(nameEl);
+      header.appendChild(actions);
+
+      const msgEl = document.createElement("div");
+      msgEl.className = "schedule-item-message";
+      msgEl.textContent = s.message;
+
+      const meta = document.createElement("div");
+      meta.className = "schedule-item-meta";
+      if (s.lastRunAt) {
+        const ran = document.createElement("span");
+        ran.textContent = `Last run: ${new Date(s.lastRunAt).toLocaleString()}`;
+        meta.appendChild(ran);
+      }
+      const cnt = document.createElement("span");
+      cnt.textContent = `Runs: ${s.runCount}`;
+      meta.appendChild(cnt);
+      if (s.lastError) {
+        const err = document.createElement("span");
+        err.className = "schedule-error";
+        err.textContent = `Error: ${s.lastError}`;
+        meta.appendChild(err);
+      }
+
+      item.appendChild(header);
+      item.appendChild(msgEl);
+      item.appendChild(meta);
+      schedulesListEl.appendChild(item);
+    }
+  }
+
+  function buildCronFromForm() {
+    const freq = schedFrequency.value;
+    if (freq === "custom") return schedCron.value.trim();
+    const [hh, mm] = (schedTime.value || "07:00").split(":");
+    const hour = Number(hh), min = Number(mm);
+    if (freq === "daily") return `${min} ${hour} * * *`;
+    if (freq === "weekdays") return `${min} ${hour} * * 1-5`;
+    if (freq === "weekly") return `${min} ${hour} * * ${schedWeekday.value}`;
+    if (freq === "monthly") return `${min} ${hour} 1 * *`;
+    return `${min} ${hour} * * *`;
+  }
+
+  function setFormFromCron(cron) {
+    const m = cron.match(/^(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)$/);
+    if (!m) {
+      schedFrequency.value = "custom";
+      schedCron.value = cron;
+      updateScheduleFormVisibility();
+      return;
+    }
+    const [, min, hour, dom, mon, dow] = m;
+    schedTime.value = `${String(hour).padStart(2,"0")}:${String(min).padStart(2,"0")}`;
+    if (dom === "*" && mon === "*" && dow === "*") schedFrequency.value = "daily";
+    else if (dom === "*" && mon === "*" && dow === "1-5") schedFrequency.value = "weekdays";
+    else if (dom === "*" && mon === "*" && /^\d$/.test(dow)) {
+      schedFrequency.value = "weekly";
+      schedWeekday.value = dow;
+    } else if (dom === "1" && mon === "*" && dow === "*") schedFrequency.value = "monthly";
+    else {
+      schedFrequency.value = "custom";
+      schedCron.value = cron;
+    }
+    updateScheduleFormVisibility();
+  }
+
+  function updateScheduleFormVisibility() {
+    const freq = schedFrequency.value;
+    schedTimeRow.style.display = freq === "custom" ? "none" : "";
+    schedWeekdayRow.style.display = freq === "weekly" ? "" : "none";
+    schedCronRow.style.display = freq === "custom" ? "" : "none";
+  }
+
+  function openScheduleDialog(id) {
+    editingScheduleId = id;
+    if (id) {
+      const s = schedules.find(x => x.id === id);
+      if (!s) return;
+      scheduleDialogTitle.textContent = "Edit Schedule";
+      schedName.value = s.name;
+      schedMessage.value = s.message;
+      setFormFromCron(s.cron);
+    } else {
+      scheduleDialogTitle.textContent = "Add Schedule";
+      schedName.value = "";
+      schedMessage.value = "";
+      schedFrequency.value = "daily";
+      schedTime.value = "07:00";
+      schedCron.value = "";
+      updateScheduleFormVisibility();
+    }
+    scheduleDialog.style.display = "flex";
+    setTimeout(() => schedName.focus(), 0);
+  }
+
+  function closeScheduleDialog() {
+    scheduleDialog.style.display = "none";
+    editingScheduleId = null;
+  }
+
+  async function saveSchedule() {
+    if (!currentSessionId) { alert("Open a session first"); return; }
+    const name = schedName.value.trim();
+    const message = schedMessage.value.trim();
+    if (!name || !message) { alert("Name and message are required"); return; }
+    const cron = buildCronFromForm();
+    if (!cron) { alert("Cron expression is required"); return; }
+    const body = { sessionId: currentSessionId, name, cron, message, enabled: true };
+    try {
+      const url = editingScheduleId ? `/api/schedules/${editingScheduleId}` : "/api/schedules";
+      const method = editingScheduleId ? "PUT" : "POST";
+      const res = await fetch(url, { method, headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) });
+      if (!res.ok) {
+        const err = await res.json();
+        alert("Error: " + (err.error || res.statusText));
+        return;
+      }
+      closeScheduleDialog();
+      await fetchSchedules();
+    } catch (e) {
+      alert("Error: " + e.message);
+    }
+  }
+
+  async function toggleSchedule(id, enabled) {
+    try {
+      await fetch(`/api/schedules/${id}`, {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ enabled })
+      });
+      await fetchSchedules();
+    } catch (e) { alert("Error: " + e.message); }
+  }
+
+  async function deleteSchedule(id) {
+    if (!confirm("Delete this schedule?")) return;
+    try {
+      await fetch(`/api/schedules/${id}`, { method: "DELETE" });
+      await fetchSchedules();
+    } catch (e) { alert("Error: " + e.message); }
+  }
+
+  function openSchedulesPanel() {
+    schedulesPanel.style.display = "flex";
+    schedulesOverlay.style.display = "block";
+    fetchSchedules();
+  }
+
+  function closeSchedulesPanel() {
+    schedulesPanel.style.display = "none";
+    schedulesOverlay.style.display = "none";
+  }
+
+  schedulesBtn.addEventListener("click", openSchedulesPanel);
+  schedulesCloseBtn.addEventListener("click", closeSchedulesPanel);
+  schedulesOverlay.addEventListener("click", closeSchedulesPanel);
+  scheduleAddBtn.addEventListener("click", () => openScheduleDialog(null));
+  scheduleDialogCancel.addEventListener("click", closeScheduleDialog);
+  scheduleDialogSave.addEventListener("click", saveSchedule);
+  schedFrequency.addEventListener("change", updateScheduleFormVisibility);
+  scheduleDialog.addEventListener("click", (e) => { if (e.target === scheduleDialog) closeScheduleDialog(); });
 
   function renderDiffResult(msg) {
     if (msg.error) {
