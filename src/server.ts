@@ -235,9 +235,9 @@ async function indexSession(sessionId: string, sessionInfo?: any): Promise<boole
 
     let msgs: any[];
     try {
-      msgs = await session.getMessages();
+      msgs = await session.getEvents();
     } catch (e: any) {
-      console.warn(`[search] getMessages failed for ${sessionId.substring(0, 8)}: ${e.message}`);
+      console.warn(`[search] getEvents failed for ${sessionId.substring(0, 8)}: ${e.message}`);
       msgs = [];
     }
     if (tempSession) {
@@ -257,9 +257,9 @@ async function indexSession(sessionId: string, sessionInfo?: any): Promise<boole
 
     const meta = sessionMeta.get(sessionId);
     const entry: SearchIndexEntry = {
-      title: meta?.name ?? sessionInfo?.title ?? sessionInfo?.name ?? "Session",
+      title: meta?.name ?? summaryToTitle(sessionInfo?.summary) ?? sessionInfo?.title ?? sessionInfo?.name ?? "Session",
       model: meta?.model ?? sessionInfo?.model ?? "",
-      cwd: meta?.cwd ?? sessionInfo?.context?.cwd ?? "",
+      cwd: meta?.cwd ?? sessionInfo?.context?.workingDirectory ?? sessionInfo?.context?.cwd ?? "",
       updatedAt,
       messages: extracted,
     };
@@ -474,6 +474,14 @@ function isAuthenticated(req: http.IncomingMessage): boolean {
 
 const copilot = new CopilotClient();
 let clientReady = false;
+
+/** Derive a short session title from the SDK's session summary field. */
+function summaryToTitle(summary?: string): string | undefined {
+  if (!summary || typeof summary !== "string") return undefined;
+  const firstLine = summary.split("\n").map(l => l.trim()).find(Boolean);
+  if (!firstLine) return undefined;
+  return firstLine.length > 80 ? firstLine.slice(0, 77) + "…" : firstLine;
+}
 let availableModels: Array<{ id: string; name: string }> = [];
 let defaultModel = process.env.COPILOT_MODEL || "";
 
@@ -613,7 +621,8 @@ async function getSessionCwd(sessionId: string): Promise<string> {
   // Fall back to SDK metadata for sessions created before local caching
   try {
     const sdkMeta = await copilot.getSessionMetadata(sessionId);
-    if (sdkMeta?.context?.cwd) return sdkMeta.context.cwd;
+    if (sdkMeta?.context?.workingDirectory) return sdkMeta.context.workingDirectory;
+    if ((sdkMeta?.context as any)?.cwd) return (sdkMeta!.context as any).cwd;
   } catch (e: any) {
     console.warn(`[meta] could not fetch cwd for ${sessionId}: ${e.message}`);
   }
@@ -2022,9 +2031,10 @@ function registerClient(ws: WebSocket, clientId: string) {
   clientConnections.set(clientId, ws);
 }
 
-function createUserInputHandler(sessionId: string) {
+function createUserInputHandler(sessionRef: string | { id: string }) {
   return (request: any, _invocation: any) => {
     return new Promise<any>((resolve) => {
+      const sessionId = typeof sessionRef === "string" ? sessionRef : sessionRef.id;
       const reqId = `uir_${++requestIdCounter}`;
       pendingUserRequests.set(reqId, { resolve });
       const promptMsg = {
@@ -2041,9 +2051,10 @@ function createUserInputHandler(sessionId: string) {
   };
 }
 
-function createElicitationHandler(sessionId: string) {
+function createElicitationHandler(sessionRef: string | { id: string }) {
   return (context: any) => {
     return new Promise<any>((resolve) => {
+      const sessionId = typeof sessionRef === "string" ? sessionRef : sessionRef.id;
       const reqId = `elic_${++requestIdCounter}`;
       pendingUserRequests.set(reqId, { resolve });
       const promptMsg = {
@@ -2410,13 +2421,17 @@ wss.on("connection", (ws: any) => {
           }
 
           console.log(`[session] creating: model=${model} cwd=${cwd}${msg.reasoningEffort ? ` reasoning=${msg.reasoningEffort}` : ""}${systemMessage ? " (from snapshot)" : ""}`);
+          // Mutable holder so the input/elicitation handlers can reference the
+          // real sessionId once createSession resolves (register* methods were
+          // removed from CopilotSession in the SDK).
+          const sessionIdRef = { id: msg.sessionId || "pending" };
           const session = await copilot.createSession({
             model,
             streaming: true,
             workingDirectory: cwd,
             onPermissionRequest: approveAll,
-            onUserInputRequest: createUserInputHandler(msg.sessionId || "pending"),
-            onElicitationRequest: createElicitationHandler(msg.sessionId || "pending"),
+            onUserInputRequest: createUserInputHandler(sessionIdRef),
+            onElicitationRequest: createElicitationHandler(sessionIdRef),
             tools: getScriptTools(),
             ...(mcpServers ? { mcpServers } : {}),
             ...(msg.reasoningEffort ? { reasoningEffort: msg.reasoningEffort } : {}),
@@ -2424,9 +2439,8 @@ wss.on("connection", (ws: any) => {
           });
 
           const sessionId = session.sessionId;
-          // Re-wire handlers with the real sessionId
-          session.registerUserInputHandler(createUserInputHandler(sessionId));
-          session.registerElicitationHandler(createElicitationHandler(sessionId));
+          // Point the handlers at the real sessionId now that we have it.
+          sessionIdRef.id = sessionId;
           activeSessions.set(sessionId, session);
           sessionMeta.set(sessionId, { model, cwd });
           saveSessionMeta();
@@ -2745,11 +2759,11 @@ wss.on("connection", (ws: any) => {
             const meta = sessionMeta.get(s.sessionId ?? s.id);
             return {
               sessionId: s.sessionId ?? s.id,
-              title: meta?.name ?? s.title ?? s.name ?? "Session",
-              cwd: meta?.cwd ?? s.context?.cwd ?? "",
+              title: meta?.name ?? summaryToTitle(s.summary) ?? s.title ?? s.name ?? "Session",
+              cwd: meta?.cwd ?? s.context?.workingDirectory ?? s.context?.cwd ?? "",
               model: meta?.model ?? s.model ?? "",
               createdAt: s.startTime ?? s.createdAt ?? "",
-              updatedAt: s.lastActiveTime ?? s.updatedAt ?? "",
+              updatedAt: s.modifiedTime ?? s.lastActiveTime ?? s.updatedAt ?? s.startTime ?? "",
             };
           }).sort((a: any, b: any) => {
             const ta = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
@@ -2836,7 +2850,7 @@ wss.on("connection", (ws: any) => {
               };
               for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                 try {
-                  const events = await session!.getMessages();
+                  const events = await session!.getEvents();
                   const history = eventsToHistory(events);
                   sessionHistoryCache.set(sessionId, history);
                   const page = history.slice(-HISTORY_PAGE_SIZE);
@@ -2865,7 +2879,7 @@ wss.on("connection", (ws: any) => {
                       activeSessions.set(sessionId, reSession);
                       session = reSession;
                       bindSessionEvents(reSession, sessionId);
-                      const events2 = await reSession.getMessages();
+                      const events2 = await reSession.getEvents();
                       const history2 = eventsToHistory(events2);
                       sessionHistoryCache.set(sessionId, history2);
                       const page2 = history2.slice(-HISTORY_PAGE_SIZE);
@@ -2972,11 +2986,11 @@ wss.on("connection", (ws: any) => {
             const meta2 = sessionMeta.get(s.sessionId ?? s.id);
             return {
               sessionId: s.sessionId ?? s.id,
-              title: meta2?.name ?? s.title ?? s.name ?? "Session",
-              cwd: meta2?.cwd ?? s.context?.cwd ?? "",
+              title: meta2?.name ?? summaryToTitle(s.summary) ?? s.title ?? s.name ?? "Session",
+              cwd: meta2?.cwd ?? s.context?.workingDirectory ?? s.context?.cwd ?? "",
               model: meta2?.model ?? s.model ?? "",
               createdAt: s.startTime ?? s.createdAt ?? "",
-              updatedAt: s.lastActiveTime ?? s.updatedAt ?? "",
+              updatedAt: s.modifiedTime ?? s.lastActiveTime ?? s.updatedAt ?? s.startTime ?? "",
             };
           }).sort((a: any, b: any) => {
             const ta = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
@@ -3032,7 +3046,7 @@ wss.on("connection", (ws: any) => {
             break;
           }
           try {
-            const events = await session.getMessages();
+            const events = await session.getEvents();
             const history = eventsToHistory(events);
             const systemMessage = historyToSystemMessage(history);
             const meta = sessionMeta.get(msg.sessionId);
