@@ -43,6 +43,39 @@ function loadMcpServers(): Record<string, any> | undefined {
 
 const mcpServers = loadMcpServers();
 
+// ── Global instructions (applied to every session, regardless of repo/cwd) ──
+// Drop text into ~/.copilot/global-instructions.md and it is appended to the
+// system message of every session this tool creates or resumes. Read fresh on
+// each call so edits take effect on the next session load (no restart needed).
+const GLOBAL_INSTRUCTIONS_PATH = path.join(
+  process.env.USERPROFILE || process.env.HOME || "",
+  ".copilot",
+  "global-instructions.md",
+);
+
+function loadGlobalInstructions(): string {
+  try {
+    if (fs.existsSync(GLOBAL_INSTRUCTIONS_PATH)) {
+      return fs.readFileSync(GLOBAL_INSTRUCTIONS_PATH, "utf-8").trim();
+    }
+  } catch (err: any) {
+    console.warn(`[instructions] failed to load ${GLOBAL_INSTRUCTIONS_PATH}: ${err.message}`);
+  }
+  return "";
+}
+
+/**
+ * Returns a spreadable object containing a SystemMessageConfig (append mode)
+ * that combines the global instructions file with any session-specific extra
+ * content (e.g. a snapshot system message). Returns {} when there is nothing
+ * to append so it can be spread unconditionally into a session config.
+ */
+function systemMessageConfig(extra?: string): { systemMessage: { mode: "append"; content: string } } | {} {
+  const parts = [loadGlobalInstructions(), (extra ?? "").trim()].filter(Boolean);
+  if (parts.length === 0) return {};
+  return { systemMessage: { mode: "append" as const, content: parts.join("\n\n") } };
+}
+
 // ── Snapshots ──
 
 interface Snapshot {
@@ -1729,6 +1762,7 @@ async function fireSchedule(scheduleId: string) {
           onElicitationRequest: createElicitationHandler(sched.sessionId),
           tools: [...getScriptTools(), ...getScheduleTools(sched.sessionId)],
           ...(mcpServers ? { mcpServers } : {}),
+          ...systemMessageConfig(),
         });
         activeSessions.set(sched.sessionId, session);
         bindSessionEvents(session, sched.sessionId);
@@ -1756,6 +1790,7 @@ async function fireSchedule(scheduleId: string) {
             onElicitationRequest: createElicitationHandler(sched.sessionId),
             tools: [...getScriptTools(), ...getScheduleTools(sched.sessionId)],
             ...(mcpServers ? { mcpServers } : {}),
+            ...systemMessageConfig(),
           });
           activeSessions.set(sched.sessionId, reSession);
           bindSessionEvents(reSession, sched.sessionId);
@@ -2435,7 +2470,7 @@ wss.on("connection", (ws: any) => {
             tools: getScriptTools(),
             ...(mcpServers ? { mcpServers } : {}),
             ...(msg.reasoningEffort ? { reasoningEffort: msg.reasoningEffort } : {}),
-            ...(systemMessage ? { systemMessage: { mode: "append" as const, content: systemMessage } } : {}),
+            ...systemMessageConfig(systemMessage),
           });
 
           const sessionId = session.sessionId;
@@ -2635,6 +2670,7 @@ wss.on("connection", (ws: any) => {
                   onElicitationRequest: createElicitationHandler(msg.sessionId),
                   tools: [...getScriptTools(), ...getScheduleTools(msg.sessionId)],
                   ...(mcpServers ? { mcpServers } : {}),
+                  ...systemMessageConfig(),
                 });
                 activeSessions.set(msg.sessionId, reSession);
                 bindSessionEvents(reSession, msg.sessionId);
@@ -2809,6 +2845,7 @@ wss.on("connection", (ws: any) => {
                 onElicitationRequest: createElicitationHandler(sessionId),
                 tools: [...getScriptTools(), ...getScheduleTools(sessionId)],
                 ...(mcpServers ? { mcpServers } : {}),
+                ...systemMessageConfig(),
               });
             } catch (resumeErr: any) {
               console.error(`[session] resume failed:`, resumeErr);
@@ -2875,6 +2912,7 @@ wss.on("connection", (ws: any) => {
                         onElicitationRequest: createElicitationHandler(sessionId),
                         tools: [...getScriptTools(), ...getScheduleTools(sessionId)],
                         ...(mcpServers ? { mcpServers } : {}),
+                        ...systemMessageConfig(),
                       });
                       activeSessions.set(sessionId, reSession);
                       session = reSession;
