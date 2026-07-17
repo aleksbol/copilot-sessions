@@ -46,6 +46,7 @@
   const stopBtn = document.getElementById("stop-btn");
   const headerCwd = document.getElementById("header-cwd");
   const headerModelSelect = document.getElementById("header-model-select");
+  const headerAic = document.getElementById("header-aic");
   const newSessionDialog = document.getElementById("new-session-dialog");
   const newCwdInput = document.getElementById("new-cwd-input");
   const newModelSelect = document.getElementById("new-model-select");
@@ -839,6 +840,12 @@
         }
         break;
 
+      case "usage_metrics":
+        if (msg.sessionId === currentSessionId) {
+          updateAicBadge(msg);
+        }
+        break;
+
       case "tool_start":
         if (msg.sessionId === currentSessionId) {
           hideThinkingIndicator();
@@ -1033,11 +1040,14 @@
 
   function updateHeaderMeta(cwd, model) {
     if (cwd != null) {
+      // A session switch should not briefly show the previous session's cost.
+      headerAic.style.display = "none";
       // On mobile, show just the folder name; on desktop show full path
       const displayCwd = window.innerWidth <= 768 ? cwd.split(/[/\\]/).filter(Boolean).pop() || cwd : cwd;
       headerCwd.textContent = displayCwd;
       headerCwd.title = cwd;
     }
+
     if (model != null) {
       headerModelSelect.style.display = "";
       // Set selected value (options already populated by fetchModels)
@@ -1050,6 +1060,28 @@
     } else {
       diffBtn.style.display = "";
     }
+  }
+
+  function updateAicBadge(metrics) {
+    const aiCredits = (metrics.totalNanoAiu || 0) / 1_000_000_000;
+    const premiumCost = metrics.totalPremiumRequestCost || 0;
+    const tokenDetails = metrics.tokenDetails || {};
+    const inputTokens = tokenDetails.input?.tokenCount || 0;
+    const outputTokens = tokenDetails.output?.tokenCount || 0;
+
+    headerAic.textContent = `${formatAic(aiCredits)} AIC`;
+    headerAic.title = [
+      `AI credits: ${formatAic(aiCredits)}`,
+      `Premium request cost: ${formatAic(premiumCost)}`,
+      `User requests: ${metrics.totalUserRequests || 0}`,
+      `Input tokens: ${formatTokens(inputTokens)}`,
+      `Output tokens: ${formatTokens(outputTokens)}`,
+    ].join("\n");
+    headerAic.style.display = "";
+  }
+
+  function formatAic(value) {
+    return value < 0.01 && value > 0 ? "<0.01" : value.toFixed(2);
   }
 
   function renderSessionList() {

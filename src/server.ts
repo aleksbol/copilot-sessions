@@ -2008,6 +2008,36 @@ function send(ws: WebSocket, data: Record<string, unknown>) {
   }
 }
 
+/**
+ * The CLI owns authoritative, session-wide billing data, including subagents.
+ * Nano-AIU is converted to AI credits only at the UI boundary.
+ */
+async function sendUsageMetrics(
+  session: CopilotSession,
+  sessionId: string,
+  target?: WebSocket,
+) {
+  try {
+    const metrics = await session.rpc.usage.getMetrics();
+    const payload = {
+      type: "usage_metrics",
+      sessionId,
+      totalNanoAiu: metrics.totalNanoAiu ?? 0,
+      totalPremiumRequestCost: metrics.totalPremiumRequestCost ?? 0,
+      totalUserRequests: metrics.totalUserRequests ?? 0,
+      tokenDetails: metrics.tokenDetails ?? {},
+      modelMetrics: metrics.modelMetrics ?? {},
+    };
+    if (target) {
+      send(target, payload);
+    } else {
+      broadcast(sessionId, payload);
+    }
+  } catch (error: any) {
+    console.warn(`[usage] failed to load metrics for ${sessionId.substring(0, 8)}: ${error.message}`);
+  }
+}
+
 /** Send a message to ALL clients subscribed to a session. Also buffers for replay. */
 function broadcast(sessionId: string, data: Record<string, unknown>, excludeWs?: WebSocket) {
   const tagged = { ...data, _mid: ++msgSeq };
@@ -2203,6 +2233,7 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
       case "assistant.turn_end":
         if (!agentId) turnDeliveredByEvents.set(sessionId, true);
         broadcast(sessionId, { type: "done", sessionId, ...agent });
+        void sendUsageMetrics(session, sessionId);
         break;
 
       // ── Tool execution start ──
@@ -3006,6 +3037,7 @@ wss.on("connection", (ws: any) => {
             cwd,
             model: meta?.model ?? "",
           });
+          await sendUsageMetrics(session, sessionId, ws);
 
           // Re-send any pending prompt (ask_user / elicitation) so the UI can render it
           const pendingPrompt = pendingPrompts.get(sessionId);
