@@ -2119,6 +2119,10 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
   boundSessionIds.add(sessionId);
   session.on((event: SessionEvent) => {
     const data = event.data as any;
+    // SDK events from delegated agents carry this identifier. It lets clients
+    // render their work outside the main conversation transcript.
+    const agentId = (event as any).agentId as string | undefined;
+    const agent = agentId ? { agentId } : {};
 
     switch (event.type) {
       // ── Streaming reasoning deltas ──
@@ -2128,6 +2132,7 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           sessionId,
           reasoningId: data.reasoningId,
           delta: data.deltaContent ?? "",
+          ...agent,
         });
         break;
 
@@ -2138,6 +2143,7 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           sessionId,
           reasoningId: data.reasoningId,
           content: data.content ?? "",
+          ...agent,
         });
         break;
 
@@ -2148,16 +2154,18 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           sessionId,
           currentTokens: data.currentTokens,
           tokenLimit: data.tokenLimit,
+          ...agent,
         });
         break;
 
       // ── Streaming text tokens ──
       case "assistant.message_delta":
-        turnDeliveredByEvents.set(sessionId, true);
+        if (!agentId) turnDeliveredByEvents.set(sessionId, true);
         broadcast(sessionId, {
           type: "token",
           sessionId,
           text: data.deltaContent ?? data.content ?? "",
+          ...agent,
         });
         break;
 
@@ -2168,24 +2176,33 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
             type: "token",
             sessionId,
             text: data.text ?? data.delta ?? data.content ?? "",
+            ...agent,
           });
         }
         break;
 
       // ── Complete assistant message ──
-      // Suppressed: sendAndWait() return value already broadcasts this.
-      // Forwarding here too would cause duplicates.
+      // Main-agent completions arrive through sendAndWait(), but delegated
+      // completions do not and must be forwarded to their inspector panel.
       case "assistant.message":
+        if (agentId && data.content) {
+          broadcast(sessionId, {
+            type: "assistant_message",
+            sessionId,
+            content: data.content,
+            ...agent,
+          });
+        }
         break;
 
       // ── Turn start/end for UI state management ──
       case "assistant.turn_start":
-        broadcast(sessionId, { type: "turn_start", sessionId });
+        broadcast(sessionId, { type: "turn_start", sessionId, ...agent });
         break;
 
       case "assistant.turn_end":
-        turnDeliveredByEvents.set(sessionId, true);
-        broadcast(sessionId, { type: "done", sessionId });
+        if (!agentId) turnDeliveredByEvents.set(sessionId, true);
+        broadcast(sessionId, { type: "done", sessionId, ...agent });
         break;
 
       // ── Tool execution start ──
@@ -2199,6 +2216,7 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           args,
           callId: event.id,
           intention: data.intention ?? "",
+          ...agent,
         });
         // Track shell processes in the process store
         if (["powershell", "bash", "shell"].includes(toolName)) {
@@ -2234,6 +2252,7 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           result: typeof result === "string" ? result : JSON.stringify(result),
           callId: event.id,
           parentId: event.parentId ?? undefined,
+          ...agent,
         });
         // Update process store if tracked — try event.id, parentId, and data.toolCallId
         const completedProc = processStore.get(event.id)
@@ -2271,6 +2290,7 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           name: data.toolName ?? data.name ?? "unknown",
           progress: data.progress ?? "",
           callId: event.id,
+          ...agent,
         });
         break;
 
@@ -2282,6 +2302,7 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           sessionId,
           callId: data.toolCallId ?? event.id,
           output: partialOutput,
+          ...agent,
         });
         // Append to process output if tracked
         const partialKey = data.toolCallId ?? event.id;
@@ -2309,6 +2330,7 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
           fileName: data.permissionRequest?.fileName ?? "",
           diff: data.permissionRequest?.diff ?? "",
           commands: data.permissionRequest?.commands ?? [],
+          ...agent,
         });
         break;
 
@@ -2358,7 +2380,10 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
         broadcast(sessionId, {
           type: "subagent_start",
           sessionId,
-          agent: data.agentName ?? data.name ?? "subagent",
+          agentId,
+          agent: data.agentDisplayName ?? data.agentName ?? data.name ?? "subagent",
+          toolCallId: data.toolCallId ?? "",
+          model: data.model ?? "",
         });
         break;
 
@@ -2366,7 +2391,26 @@ function bindSessionEvents(session: CopilotSession, sessionId: string) {
         broadcast(sessionId, {
           type: "subagent_done",
           sessionId,
-          agent: data.agentName ?? data.name ?? "subagent",
+          agentId,
+          agent: data.agentDisplayName ?? data.agentName ?? data.name ?? "subagent",
+          toolCallId: data.toolCallId ?? "",
+          durationMs: data.durationMs,
+          totalTokens: data.totalTokens,
+          totalToolCalls: data.totalToolCalls,
+        });
+        break;
+
+      case "subagent.failed":
+        broadcast(sessionId, {
+          type: "subagent_failed",
+          sessionId,
+          agentId,
+          agent: data.agentDisplayName ?? data.agentName ?? data.name ?? "subagent",
+          toolCallId: data.toolCallId ?? "",
+          error: data.error ?? "Subagent failed",
+          durationMs: data.durationMs,
+          totalTokens: data.totalTokens,
+          totalToolCalls: data.totalToolCalls,
         });
         break;
 
@@ -3253,6 +3297,7 @@ function eventsToHistory(events: SessionEvent[]): any[] {
         messages.push({
           role: "user",
           content: data.content ?? data.text ?? "",
+          agentId: (event as any).agentId ?? undefined,
           timestamp: event.timestamp,
         });
         break;
@@ -3261,6 +3306,7 @@ function eventsToHistory(events: SessionEvent[]): any[] {
         messages.push({
           role: "assistant",
           content: data.content ?? "",
+          agentId: (event as any).agentId ?? undefined,
           timestamp: event.timestamp,
         });
         break;
@@ -3272,6 +3318,7 @@ function eventsToHistory(events: SessionEvent[]): any[] {
           args: data.arguments ?? data.args ?? data.input ?? {},
           callId: event.id,
           intention: data.intention ?? "",
+          agentId: (event as any).agentId ?? undefined,
           timestamp: event.timestamp,
         });
         break;
@@ -3284,10 +3331,32 @@ function eventsToHistory(events: SessionEvent[]): any[] {
           result: typeof result === "string" ? result : JSON.stringify(result),
           callId: event.id,
           parentId: event.parentId ?? undefined,
+          agentId: (event as any).agentId ?? undefined,
           timestamp: event.timestamp,
         });
         break;
       }
+
+      case "subagent.started":
+      case "subagent.completed":
+      case "subagent.failed":
+        messages.push({
+          role: event.type === "subagent.started"
+            ? "subagent_start"
+            : event.type === "subagent.completed"
+              ? "subagent_done"
+              : "subagent_failed",
+          agentId: (event as any).agentId ?? undefined,
+          agent: data.agentDisplayName ?? data.agentName ?? data.name ?? "subagent",
+          toolCallId: data.toolCallId ?? "",
+          model: data.model ?? "",
+          durationMs: data.durationMs,
+          totalTokens: data.totalTokens,
+          totalToolCalls: data.totalToolCalls,
+          error: data.error ?? "",
+          timestamp: event.timestamp,
+        });
+        break;
     }
   }
 
@@ -3310,14 +3379,30 @@ function seedBufferFromHistory(sessionId: string, history: any[]) {
         break;
       case "assistant":
         if (msg.content) {
-          buf.push({ type: "assistant_message", sessionId, content: msg.content });
+          buf.push({ type: "assistant_message", sessionId, content: msg.content, agentId: msg.agentId });
         }
         break;
       case "tool_call":
-        buf.push({ type: "tool_start", sessionId, name: msg.name, args: msg.args, callId: msg.callId, intention: msg.intention });
+        buf.push({ type: "tool_start", sessionId, name: msg.name, args: msg.args, callId: msg.callId, intention: msg.intention, agentId: msg.agentId });
         break;
       case "tool_result":
-        buf.push({ type: "tool_result", sessionId, name: msg.name, result: msg.result, callId: msg.callId, parentId: msg.parentId });
+        buf.push({ type: "tool_result", sessionId, name: msg.name, result: msg.result, callId: msg.callId, parentId: msg.parentId, agentId: msg.agentId });
+        break;
+      case "subagent_start":
+      case "subagent_done":
+      case "subagent_failed":
+        buf.push({
+          type: msg.role,
+          sessionId,
+          agentId: msg.agentId,
+          agent: msg.agent,
+          toolCallId: msg.toolCallId,
+          model: msg.model,
+          durationMs: msg.durationMs,
+          totalTokens: msg.totalTokens,
+          totalToolCalls: msg.totalToolCalls,
+          error: msg.error,
+        });
         break;
     }
   }
@@ -3327,11 +3412,13 @@ function seedBufferFromHistory(sessionId: string, history: any[]) {
 function bufferToHistory(buffer: any[]): any[] {
   const messages: any[] = [];
   let pendingTokens = "";
+  let pendingTokenAgentId: string | undefined;
 
   function flushTokens() {
     if (pendingTokens) {
-      messages.push({ role: "assistant", content: pendingTokens });
+      messages.push({ role: "assistant", content: pendingTokens, agentId: pendingTokenAgentId });
       pendingTokens = "";
+      pendingTokenAgentId = undefined;
     }
   }
 
@@ -3345,11 +3432,13 @@ function bufferToHistory(buffer: any[]): any[] {
       case "assistant_message":
         flushTokens();
         if (evt.content) {
-          messages.push({ role: "assistant", content: evt.content });
+          messages.push({ role: "assistant", content: evt.content, agentId: evt.agentId });
         }
         break;
 
       case "token":
+        if (pendingTokens && pendingTokenAgentId !== evt.agentId) flushTokens();
+        pendingTokenAgentId = evt.agentId;
         pendingTokens += evt.text ?? "";
         break;
 
@@ -3369,6 +3458,7 @@ function bufferToHistory(buffer: any[]): any[] {
           args: evt.args ?? {},
           callId: evt.callId,
           intention: evt.intention ?? "",
+          agentId: evt.agentId,
         });
         break;
 
@@ -3379,6 +3469,23 @@ function bufferToHistory(buffer: any[]): any[] {
           result: evt.result ?? "",
           callId: evt.callId,
           parentId: evt.parentId,
+          agentId: evt.agentId,
+        });
+        break;
+      case "subagent_start":
+      case "subagent_done":
+      case "subagent_failed":
+        flushTokens();
+        messages.push({
+          role: evt.type,
+          agentId: evt.agentId,
+          agent: evt.agent,
+          toolCallId: evt.toolCallId,
+          model: evt.model,
+          durationMs: evt.durationMs,
+          totalTokens: evt.totalTokens,
+          totalToolCalls: evt.totalToolCalls,
+          error: evt.error,
         });
         break;
     }

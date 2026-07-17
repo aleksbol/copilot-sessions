@@ -107,6 +107,10 @@
           </svg>
           <span id="processes-badge" class="processes-badge" style="display:none">0</span>
         </button>
+        <button id="subagents-btn" class="btn-icon processes-btn" title="View delegated agents">
+          🤖
+          <span id="subagents-badge" class="processes-badge" style="display:none">0</span>
+        </button>
         <a href="/scripts" target="_blank" class="btn-icon scripts-link-btn" title="Open Scripts page">
           <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
             <path d="M5.5 3.5L11 8l-5.5 4.5V3.5z"/>
@@ -219,6 +223,25 @@
     </div>
   </div>
   <div id="processes-overlay" class="processes-overlay" style="display:none"></div>
+
+  <!-- Delegated agents panel -->
+  <div id="subagents-panel" class="subagents-panel" style="display:none">
+    <div class="processes-panel-header">
+      <h2>Delegated Agents</h2>
+      <div class="processes-panel-actions">
+        <button id="subagents-close-btn" class="btn-icon" title="Close">✕</button>
+      </div>
+    </div>
+    <div class="subagents-layout">
+      <div id="subagents-list" class="subagents-list">
+        <div class="processes-empty">No delegated agents in this session</div>
+      </div>
+      <div id="subagent-detail" class="subagent-detail">
+        <div class="processes-empty">Select an agent to inspect its work</div>
+      </div>
+    </div>
+  </div>
+  <div id="subagents-overlay" class="processes-overlay" style="display:none"></div>
 
   <!-- Schedules panel -->
   <div id="schedules-panel" class="processes-panel" style="display:none">

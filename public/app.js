@@ -21,6 +21,8 @@
   const seenMessageIds = new Set();
   const reasoningBlocks = new Map(); // reasoningId → { block, contentEl, streaming }
   const trackedProcesses = new Map(); // processId → process object
+  const subagents = new Map(); // agentId/toolCallId → delegated agent activity
+  let selectedSubagentKey = null;
   let sendMode = "normal"; // "normal" or "loop"
   let loopActive = false;
   const loopingSessions = new Set(); // sessionIds with active loops
@@ -65,6 +67,13 @@
   const processesCloseBtn = document.getElementById("processes-close-btn");
   const processesListEl = document.getElementById("processes-list");
   const processesBadge = document.getElementById("processes-badge");
+  const subagentsBtn = document.getElementById("subagents-btn");
+  const subagentsPanel = document.getElementById("subagents-panel");
+  const subagentsOverlay = document.getElementById("subagents-overlay");
+  const subagentsCloseBtn = document.getElementById("subagents-close-btn");
+  const subagentsListEl = document.getElementById("subagents-list");
+  const subagentDetailEl = document.getElementById("subagent-detail");
+  const subagentsBadge = document.getElementById("subagents-badge");
   const sendModeMenu = document.getElementById("send-mode-menu");
   const sendBtnWrapper = document.querySelector(".send-btn-wrapper");
   const loopIndicator = document.getElementById("loop-indicator");
@@ -699,6 +708,18 @@
         // Actually just let it grow to 500, it's fine
       }
     }
+    // Delegated-agent traffic has its own inspector. Keep it out of the main
+    // transcript, which otherwise becomes unreadable during parallel work.
+    const delegatedEventTypes = new Set([
+      "token", "assistant_message", "reasoning_delta", "reasoning",
+      "tool_start", "tool_result", "tool_partial", "tool_progress",
+      "turn_start", "done", "usage_info",
+    ]);
+    if (msg.sessionId === currentSessionId && msg.agentId && delegatedEventTypes.has(msg.type)) {
+      recordSubagentEvent(msg);
+      return;
+    }
+
     switch (msg.type) {
       case "pong":
         onPong();
@@ -965,15 +986,15 @@
         break;
 
       case "subagent_start":
-        if (msg.sessionId === currentSessionId) {
-          appendInfoMessage(`Delegating to ${msg.agent}...`);
-        }
+        if (msg.sessionId === currentSessionId) recordSubagentLifecycle(msg, "running");
         break;
 
       case "subagent_done":
-        if (msg.sessionId === currentSessionId) {
-          appendInfoMessage(`${msg.agent} finished`);
-        }
+        if (msg.sessionId === currentSessionId) recordSubagentLifecycle(msg, "done");
+        break;
+
+      case "subagent_failed":
+        if (msg.sessionId === currentSessionId) recordSubagentLifecycle(msg, "failed");
         break;
 
       case "error":
@@ -1163,6 +1184,9 @@
 
   function clearMessages() {
     messagesEl.innerHTML = "";
+    subagents.clear();
+    selectedSubagentKey = null;
+    renderSubagents();
     historyHasMore = false;
     historyLoadedCount = 0;
     loadingMoreHistory = false;
@@ -1179,6 +1203,31 @@
 
     let lastRole = null;
     for (const msg of messages) {
+      if (msg.role === "subagent_start") {
+        recordSubagentLifecycle(msg, "running");
+        continue;
+      }
+      if (msg.role === "subagent_done") {
+        recordSubagentLifecycle(msg, "done");
+        continue;
+      }
+      if (msg.role === "subagent_failed") {
+        recordSubagentLifecycle(msg, "failed");
+        continue;
+      }
+      if (msg.agentId) {
+        recordSubagentEvent({
+          type: msg.role === "assistant"
+            ? "assistant_message"
+            : msg.role === "user"
+              ? "user_message"
+            : msg.role === "tool_call"
+              ? "tool_start"
+              : "tool_result",
+          ...msg,
+        });
+        continue;
+      }
       switch (msg.role) {
         case "user":
           appendUserMessage(msg.content, msg.timestamp);
@@ -1202,8 +1251,168 @@
       }
       lastRole = msg.role;
     }
+  }
 
-    scrollToBottom();
+  // ── Delegated-agent inspector ──
+
+  function getSubagentEntry(msg) {
+    let key = msg.agentId || (msg.toolCallId ? `tool:${msg.toolCallId}` : "");
+    if (msg.agentId && !subagents.has(key)) {
+      // Lifecycle events do not always carry the instance id. When there is one
+      // unclaimed running agent, associate its metadata with first tagged event.
+      const pending = [...subagents.entries()].filter(([pendingKey, entry]) =>
+        pendingKey.startsWith("tool:") && entry.status === "running");
+      if (pending.length === 1) {
+        const [pendingKey, entry] = pending[0];
+        subagents.delete(pendingKey);
+        entry.key = key;
+        entry.agentId = msg.agentId;
+        subagents.set(key, entry);
+        return entry;
+      }
+    }
+    if (!key) key = `unknown:${subagents.size + 1}`;
+    let entry = subagents.get(key);
+    if (!entry) {
+      entry = {
+        key,
+        agentId: msg.agentId || "",
+        toolCallId: msg.toolCallId || "",
+        name: msg.agent || "Subagent",
+        model: msg.model || "",
+        status: "running",
+        events: [],
+      };
+      subagents.set(key, entry);
+    }
+    return entry;
+  }
+
+  function recordSubagentLifecycle(msg, status) {
+    const entry = getSubagentEntry(msg);
+    entry.name = msg.agent || entry.name;
+    entry.model = msg.model || entry.model;
+    entry.status = status;
+    entry.durationMs = msg.durationMs;
+    entry.totalTokens = msg.totalTokens;
+    entry.totalToolCalls = msg.totalToolCalls;
+    entry.error = msg.error || "";
+    renderSubagents();
+  }
+
+  function recordSubagentEvent(msg) {
+    const entry = getSubagentEntry(msg);
+    const last = entry.events[entry.events.length - 1];
+    // Avoid a row for every token while preserving streamed output.
+    if (msg.type === "token" && last?.type === "token") {
+      last.text += msg.text || "";
+    } else if (msg.type === "assistant_message" && last?.type === "token") {
+      // The final message repeats streamed tokens. Replace rather than render it twice.
+      last.type = "assistant_message";
+      last.text = msg.content || last.text;
+    } else {
+      entry.events.push({
+        type: msg.type,
+        text: msg.text || msg.content || "",
+        name: msg.name || "",
+        args: msg.args,
+        result: msg.result || msg.output || "",
+        progress: msg.progress || "",
+        timestamp: msg.timestamp,
+      });
+    }
+    renderSubagents();
+  }
+
+  function updateSubagentsBadge() {
+    const active = [...subagents.values()].filter((entry) => entry.status === "running").length;
+    if (active) {
+      subagentsBadge.textContent = active;
+      subagentsBadge.style.display = "";
+    } else {
+      subagentsBadge.style.display = "none";
+    }
+  }
+
+  function renderSubagents() {
+    updateSubagentsBadge();
+    const entries = [...subagents.values()];
+    if (!entries.length) {
+      subagentsListEl.innerHTML = '<div class="processes-empty">No delegated agents in this session</div>';
+      subagentDetailEl.innerHTML = '<div class="processes-empty">Select an agent to inspect its work</div>';
+      return;
+    }
+
+    if (!selectedSubagentKey || !subagents.has(selectedSubagentKey)) {
+      selectedSubagentKey = entries[0].key;
+    }
+    subagentsListEl.innerHTML = "";
+    for (const entry of entries) {
+      const button = document.createElement("button");
+      button.className = `subagent-item${entry.key === selectedSubagentKey ? " active" : ""}`;
+      button.innerHTML = `<span class="subagent-status ${entry.status}"></span><span class="subagent-name"></span><span class="subagent-count">${entry.events.length}</span>`;
+      button.querySelector(".subagent-name").textContent = entry.name;
+      button.addEventListener("click", () => {
+        selectedSubagentKey = entry.key;
+        renderSubagents();
+      });
+      subagentsListEl.appendChild(button);
+    }
+    renderSelectedSubagent();
+  }
+
+  function renderSelectedSubagent() {
+    const entry = subagents.get(selectedSubagentKey);
+    if (!entry) return;
+    subagentDetailEl.innerHTML = "";
+    const header = document.createElement("div");
+    header.className = "subagent-detail-header";
+    const metadata = [
+      entry.status,
+      entry.model,
+      entry.totalToolCalls != null ? `${entry.totalToolCalls} tools` : "",
+      entry.durationMs != null ? `${(entry.durationMs / 1000).toFixed(1)}s` : "",
+    ].filter(Boolean).join(" · ");
+    header.innerHTML = `<strong></strong><span></span>`;
+    header.querySelector("strong").textContent = entry.name;
+    header.querySelector("span").textContent = metadata;
+    subagentDetailEl.appendChild(header);
+    if (entry.error) {
+      const error = document.createElement("div");
+      error.className = "subagent-error";
+      error.textContent = entry.error;
+      subagentDetailEl.appendChild(error);
+    }
+    const events = document.createElement("div");
+    events.className = "subagent-events";
+    for (const event of entry.events) {
+      const row = document.createElement("div");
+      row.className = `subagent-event subagent-event-${event.type.replace(/[^a-z0-9_-]/gi, "-")}`;
+      if (event.type === "assistant_message" || event.type === "token") {
+        row.innerHTML = renderMarkdown(event.text);
+      } else if (event.type === "user_message") {
+        row.textContent = `User: ${event.text}`;
+      } else if (event.type === "tool_start") {
+        const args = typeof event.args === "string" ? event.args : JSON.stringify(event.args || {});
+        row.textContent = `⚡ ${event.name}${args && args !== "{}" ? ` — ${truncate(args, 180)}` : ""}`;
+      } else if (event.type === "tool_result") {
+        row.textContent = `↳ ${event.name || "Tool"}: ${truncate(event.result, 400)}`;
+      } else if (event.type === "reasoning" || event.type === "reasoning_delta") {
+        row.textContent = `🧠 ${event.text}`;
+      } else if (event.type === "tool_progress") {
+        row.textContent = `… ${event.name}: ${event.progress}`;
+      } else if (event.type === "tool_partial") {
+        row.textContent = event.result;
+      }
+      if (row.textContent || row.innerHTML) events.appendChild(row);
+    }
+    if (!events.childElementCount) {
+      events.innerHTML = '<div class="processes-empty">Waiting for agent activity</div>';
+    }
+    subagentDetailEl.appendChild(events);
+    highlightRenderedCode(subagentDetailEl);
+    addCopyButtons(subagentDetailEl);
+
   }
 
   /** Render older messages at the top, preserving scroll position */
@@ -1220,6 +1429,31 @@
 
     let lastRole = null;
     for (const msg of messages) {
+      if (msg.role === "subagent_start") {
+        recordSubagentLifecycle(msg, "running");
+        continue;
+      }
+      if (msg.role === "subagent_done") {
+        recordSubagentLifecycle(msg, "done");
+        continue;
+      }
+      if (msg.role === "subagent_failed") {
+        recordSubagentLifecycle(msg, "failed");
+        continue;
+      }
+      if (msg.agentId) {
+        recordSubagentEvent({
+          type: msg.role === "assistant"
+            ? "assistant_message"
+            : msg.role === "user"
+              ? "user_message"
+            : msg.role === "tool_call"
+              ? "tool_start"
+              : "tool_result",
+          ...msg,
+        });
+        continue;
+      }
       let el = null;
       switch (msg.role) {
         case "user":
@@ -2336,6 +2570,21 @@
   processesBtn.addEventListener("click", openProcessesPanel);
   processesCloseBtn.addEventListener("click", closeProcessesPanel);
   processesOverlay.addEventListener("click", closeProcessesPanel);
+
+  function openSubagentsPanel() {
+    subagentsPanel.style.display = "flex";
+    subagentsOverlay.style.display = "block";
+    renderSubagents();
+  }
+
+  function closeSubagentsPanel() {
+    subagentsPanel.style.display = "none";
+    subagentsOverlay.style.display = "none";
+  }
+
+  subagentsBtn.addEventListener("click", openSubagentsPanel);
+  subagentsCloseBtn.addEventListener("click", closeSubagentsPanel);
+  subagentsOverlay.addEventListener("click", closeSubagentsPanel);
 
   function updateProcessBadge() {
     const running = [...trackedProcesses.values()].filter(p => p.status === "running").length;
